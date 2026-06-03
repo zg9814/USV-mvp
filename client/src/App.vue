@@ -51,7 +51,7 @@ type MapPoint = {
 };
 
 type MissionState = {
-  status: 'idle' | 'uploading' | 'active' | 'paused' | 'completed';
+  status: 'idle' | 'uploading' | 'ready' | 'active' | 'paused' | 'completed';
   waypoints: Waypoint[];
   currentWaypoint: number;
   totalWaypoints: number;
@@ -178,19 +178,18 @@ const displayLngLabel = computed(() => displayShipPoint.value ? displayShipPoint
 const displayLatLabel = computed(() => displayShipPoint.value ? displayShipPoint.value.lat.toFixed(7) : '--');
 const routeLengthMeters = computed(() => calculateRouteLength(waypoints.value));
 const routeLengthLabel = computed(() => formatDistance(routeLengthMeters.value));
-const missionUploadItemCount = computed(() => waypoints.value.length + (missionLoopCount.value > 1 && waypoints.value.length > 0 ? 1 : 0));
+const missionUploadItemCount = computed(() => waypoints.value.length === 0 ? 0 : waypoints.value.length + 1 + (missionLoopCount.value > 1 ? 1 : 0));
 const missionLoopProgressLabel = computed(() => {
   if (mission.status !== 'active' && mission.status !== 'paused') return '';
   return `任务进行中 ${missionCurrentLoop.value}/${missionActiveLoopCount.value}`;
 });
 const missionStatusLabel = computed(() => {
-  const labels: Record<string, string> = { idle: '空闲', uploading: '上传中', active: '执行中', paused: '已暂停', completed: '已完成' };
+  const labels: Record<string, string> = { idle: '空闲', uploading: '写入中', ready: '已写入', active: '执行中', paused: '已暂停', completed: '已完成' };
   return labels[mission.status] || mission.status;
 });
 const modes = [
   { key: 'manual', label: '手动' },
   { key: 'hold', label: '保持' },
-  { key: 'mission', label: '自动任务' },
   { key: 'rtl', label: '返航' },
   { key: 'posctl', label: '位置' },
   { key: 'stabilized', label: '增稳' }
@@ -285,9 +284,13 @@ function connectWs() {
       statusText.value = `到达航点 ${message.data.seq + 1}`;
     }
     if (message.type === 'mission.uploaded') {
-      mission.status = message.data.success ? 'active' : 'idle';
+      mission.status = message.data.success ? 'ready' : 'idle';
       if (!message.data.success) resetMissionLoopProgress();
-      statusText.value = message.data.success ? '航线上传成功' : '航线上传失败';
+      statusText.value = message.data.success ? '航点写入成功' : `航点写入失败：${message.data.result ?? '未收到飞控确认'}`;
+    }
+    if (message.type === 'mission.started') {
+      mission.status = 'active';
+      statusText.value = '任务已开始执行';
     }
     if (message.type === 'mission.paused') {
       mission.status = 'paused';
@@ -315,8 +318,23 @@ function connectWs() {
 }
 
 function send(type: string, data: unknown = {}) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   ws.send(JSON.stringify({ type, data }));
+  return true;
+}
+
+async function postJson<T = { ok: boolean; message?: string }>(url: string, data: unknown = {}) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  });
+  const result = await response.json() as T;
+  if (!response.ok) {
+    const message = typeof result === 'object' && result && 'message' in result ? String(result.message) : response.statusText;
+    throw new Error(message);
+  }
+  return result;
 }
 
 function sendManual() {
@@ -330,7 +348,7 @@ function command(type: string) {
   send(type);
 }
 
-function uploadMission() {
+async function uploadMission() {
   if (waypoints.value.length === 0) return;
   const loopCount = clamp(Math.round(missionLoopCount.value), MISSION_LOOP_MIN, MISSION_LOOP_MAX);
   missionLoopCount.value = loopCount;
@@ -341,19 +359,58 @@ function uploadMission() {
   mission.waypoints = waypoints.value;
   mission.currentWaypoint = 0;
   mission.totalWaypoints = missionUploadItemCount.value;
-  send('mission.upload', { waypoints: waypoints.value, loopCount });
+  try {
+    const result = await postJson('/api/mission/upload', { waypoints: waypoints.value, loopCount });
+    statusText.value = result.message || '航点写入请求已发送';
+  } catch (error) {
+    mission.status = 'idle';
+    resetMissionLoopProgress();
+    statusText.value = `航点写入失败：${error instanceof Error ? error.message : '未知错误'}`;
+  }
 }
 
-function pauseMission() {
-  send('mission.pause');
+async function startMission() {
+  try {
+    const result = await postJson('/api/mission/start');
+    mission.status = 'active';
+    statusText.value = result.message || '任务已开始执行';
+  } catch (error) {
+    statusText.value = `开始执行失败：${error instanceof Error ? error.message : '未知错误'}`;
+  }
 }
 
-function resumeMission() {
-  send('mission.resume');
+async function pauseMission() {
+  try {
+    const result = await postJson('/api/mission/pause');
+    mission.status = 'paused';
+    statusText.value = result.message || '任务已暂停';
+  } catch (error) {
+    statusText.value = `暂停任务失败：${error instanceof Error ? error.message : '未知错误'}`;
+  }
 }
 
-function clearMission() {
-  send('mission.clear');
+async function resumeMission() {
+  try {
+    const result = await postJson('/api/mission/resume');
+    mission.status = 'active';
+    statusText.value = result.message || '任务已继续';
+  } catch (error) {
+    statusText.value = `继续任务失败：${error instanceof Error ? error.message : '未知错误'}`;
+  }
+}
+
+async function clearMission() {
+  try {
+    const result = await postJson('/api/mission/clear');
+    mission.status = 'idle';
+    mission.waypoints = [];
+    mission.currentWaypoint = 0;
+    mission.totalWaypoints = 0;
+    resetMissionLoopProgress();
+    statusText.value = result.message || '航线已清除';
+  } catch (error) {
+    statusText.value = `清除任务失败：${error instanceof Error ? error.message : '未知错误'}`;
+  }
 }
 
 function updateMissionCurrent(seq: number) {
@@ -1075,6 +1132,9 @@ function setupMapPointerBehavior() {
             </div>
             <div class="mission-buttons">
               <button v-if="mission.status === 'idle'" @click="uploadMission" :disabled="waypoints.length === 0">
+                写入航点
+              </button>
+              <button v-if="mission.status === 'ready'" @click="startMission">
                 开始执行
               </button>
               <button v-if="mission.status === 'active'" @click="pauseMission">

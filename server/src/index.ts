@@ -14,6 +14,9 @@ import {
   buildMissionDoJumpInt,
   buildMissionClearAll,
   buildMissionSetCurrent,
+  buildMissionRequestList,
+  buildMissionRequestInt,
+  buildMissionAck,
   decodeFrames,
   parseBatteryStatus,
   parseCommandAck,
@@ -25,10 +28,14 @@ import {
   parseSysStatus,
   parseVfrHud,
   parseMissionRequest,
+  parseMissionCount,
+  parseMissionItem,
+  parseMissionItemInt,
   parseMissionAck,
   parseMissionCurrent,
   parseMissionItemReached
 } from './mavlink.js';
+import type { MavlinkFrame, ParsedMissionItem } from './mavlink.js';
 import { UsvStore } from './state.js';
 import type { ManualControlInput, UsvState, Waypoint, MissionItem } from './types.js';
 
@@ -45,6 +52,18 @@ let lastManualInputAt = 0;
 let lastSentZeroAt = 0;
 let missionUploadInProgress = false;
 let pendingMissionItems: MissionItem[] = [];
+let lastUploadMissionItems: MissionItem[] = [];
+let missionUploadStartTimer: NodeJS.Timeout | null = null;
+let missionUploadTimer: NodeJS.Timeout | null = null;
+const MISSION_UPLOAD_TIMEOUT_MS = 10_000;
+const MISSION_CLEAR_BEFORE_UPLOAD_DELAY_MS = 300;
+let missionReadbackInProgress = false;
+let missionReadbackReason = '';
+let missionReadbackExpectedCount = 0;
+let missionReadbackNextSeq = 0;
+let missionReadbackItems = new Map<number, ParsedMissionItem>();
+let missionReadbackTimer: NodeJS.Timeout | null = null;
+const MISSION_READBACK_TIMEOUT_MS = 8_000;
 
 udp.on('message', (packet, remote) => {
   const frames = decodeFrames(packet);
@@ -111,11 +130,28 @@ udp.on('message', (packet, remote) => {
         break;
       }
       // ==================== 航线消息处理 ====================
+      case 39: {
+        const item = parseMissionItem(frame.payload);
+        if (item && missionReadbackInProgress) {
+          logMissionRxFrame(frame, `MISSION_ITEM seq=${item.seq}`);
+          handleMissionReadbackItem(frame.systemId, frame.componentId, item);
+        }
+        break;
+      }
       case 40:
       case 51: { // MISSION_REQUEST / MISSION_REQUEST_INT - 飞控请求航点
         const request = parseMissionRequest(frame.payload);
         if (request && missionUploadInProgress) {
+          logMissionRxFrame(frame, `MISSION_REQUEST seq=${request.sequence}`);
           handleMissionRequest(frame.systemId, frame.componentId, request.sequence);
+        }
+        break;
+      }
+      case 44: {
+        const count = parseMissionCount(frame.payload);
+        if (count && missionReadbackInProgress) {
+          logMissionRxFrame(frame, `MISSION_COUNT count=${count.count}`);
+          handleMissionReadbackCount(frame.systemId, frame.componentId, count.count);
         }
         break;
       }
@@ -137,7 +173,16 @@ udp.on('message', (packet, remote) => {
       case 47: { // MISSION_ACK - 航线上传确认
         const ack = parseMissionAck(frame.payload);
         if (ack) {
+          logMissionRxFrame(frame, `MISSION_ACK type=${ack.type} result=${ack.result}`);
           handleMissionAck(ack.type, ack.result);
+        }
+        break;
+      }
+      case 73: {
+        const item = parseMissionItemInt(frame.payload);
+        if (item && missionReadbackInProgress) {
+          logMissionRxFrame(frame, `MISSION_ITEM_INT seq=${item.seq}`);
+          handleMissionReadbackItem(frame.systemId, frame.componentId, item);
         }
         break;
       }
@@ -163,35 +208,157 @@ function handleMissionRequest(targetSystem: number, targetComponent: number, seq
     const item = pendingMissionItems[sequence];
     const frame = item.type === 'doJump'
       ? buildMissionDoJumpInt(targetSystem, targetComponent, sequence, item.target, item.repeat)
-      : buildMissionItemInt(targetSystem, targetComponent, sequence, item.lat, item.lng);
-    udp.send(frame, store.getState().remote!.port, store.getState().remote!.address);
+      : buildMissionItemInt(targetSystem, targetComponent, sequence, item.lat, item.lng, item.altitude ?? 0, 16, item.type === 'home' ? 0 : 6);
+    sendMissionFrame(frame, item.type === 'doJump' ? `MISSION_DO_JUMP_INT seq=${sequence}` : `MISSION_ITEM_INT seq=${sequence}`);
     console.log(item.type === 'doJump'
       ? `Sent DO_JUMP ${sequence}: target=${item.target} repeat=${item.repeat}`
-      : `Sent waypoint ${sequence}: ${item.lat}, ${item.lng}`);
+      : `Sent waypoint ${sequence} as MISSION_ITEM_INT: ${item.lat}, ${item.lng}`);
   }
+}
+
+function sendMissionFrame(frame: Buffer, label: string): void {
+  const remote = store.getState().remote;
+  if (!remote) return;
+  const messageId = frame.length >= 10 ? frame[7] | (frame[8] << 8) | (frame[9] << 16) : -1;
+  const txSeq = frame.length >= 5 ? frame[4] : -1;
+  console.log(`TX MAVLink ${label} msg=${messageId} txSeq=${txSeq} bytes=${frame.length} to=${remote.address}:${remote.port} hex=${frame.toString('hex')}`);
+  udp.send(frame, remote.port, remote.address);
+}
+
+function logMissionRxFrame(frame: MavlinkFrame, label: string): void {
+  console.log(`RX MAVLink ${label} msg=${frame.messageId} mavlink=${frame.version} rxSeq=${frame.sequence} sys=${frame.systemId} comp=${frame.componentId} bytes=${frame.raw.length} hex=${frame.raw.toString('hex')}`);
+}
+
+function startMissionReadback(reason: string): void {
+  const state = store.getState();
+  if (!state.online || !state.remote) {
+    console.log(`Mission readback skipped: USV offline (${reason})`);
+    return;
+  }
+
+  clearMissionReadbackTimer();
+  missionReadbackInProgress = true;
+  missionReadbackReason = reason;
+  missionReadbackExpectedCount = 0;
+  missionReadbackNextSeq = 0;
+  missionReadbackItems = new Map<number, ParsedMissionItem>();
+
+  sendMissionFrame(buildMissionRequestList(state.systemId, state.componentId || 1), `MISSION_REQUEST_LIST reason=${reason}`);
+  missionReadbackTimer = setTimeout(() => {
+    finishMissionReadback(`timeout waiting for readback (${reason})`);
+  }, MISSION_READBACK_TIMEOUT_MS);
+}
+
+function handleMissionReadbackCount(targetSystem: number, targetComponent: number, count: number): void {
+  if (!missionReadbackInProgress) return;
+  missionReadbackExpectedCount = count;
+  missionReadbackNextSeq = 0;
+  console.log(`Mission readback count=${count} reason=${missionReadbackReason}`);
+  if (count === 0) {
+    sendMissionFrame(buildMissionAck(targetSystem, targetComponent, 0), 'MISSION_ACK readback empty');
+    finishMissionReadback('complete');
+    return;
+  }
+  requestMissionReadbackItem(targetSystem, targetComponent, 0);
+}
+
+function handleMissionReadbackItem(targetSystem: number, targetComponent: number, item: ParsedMissionItem): void {
+  if (!missionReadbackInProgress) return;
+  missionReadbackItems.set(item.seq, item);
+  console.log(`Mission readback item seq=${item.seq} command=${item.command} frame=${item.frame} current=${item.current} autocontinue=${item.autocontinue} lat=${item.lat.toFixed(7)} lng=${item.lng.toFixed(7)} alt=${item.altitude.toFixed(2)}`);
+
+  const nextSeq = item.seq + 1;
+  if (nextSeq >= missionReadbackExpectedCount) {
+    sendMissionFrame(buildMissionAck(targetSystem, targetComponent, 0), 'MISSION_ACK readback complete');
+    finishMissionReadback('complete');
+    return;
+  }
+  missionReadbackNextSeq = nextSeq;
+  requestMissionReadbackItem(targetSystem, targetComponent, nextSeq);
+}
+
+function requestMissionReadbackItem(targetSystem: number, targetComponent: number, sequence: number): void {
+  sendMissionFrame(buildMissionRequestInt(targetSystem, targetComponent, sequence), `MISSION_REQUEST_INT readback seq=${sequence}`);
+}
+
+function finishMissionReadback(status: string): void {
+  if (!missionReadbackInProgress) return;
+  clearMissionReadbackTimer();
+  const items = [...missionReadbackItems.values()].sort((a, b) => a.seq - b.seq);
+  console.log(`Mission readback ${status}: expected=${missionReadbackExpectedCount} received=${items.length} reason=${missionReadbackReason}`);
+  for (const item of items) {
+    console.log(`Mission readback summary seq=${item.seq} command=${item.command} lat=${item.lat.toFixed(7)} lng=${item.lng.toFixed(7)} alt=${item.altitude.toFixed(2)}`);
+  }
+  missionReadbackInProgress = false;
+  const reason = missionReadbackReason;
+  missionReadbackReason = '';
+  missionReadbackExpectedCount = 0;
+  missionReadbackNextSeq = 0;
+  missionReadbackItems = new Map<number, ParsedMissionItem>();
+
+  if (reason.startsWith('upload-')) {
+    if (status === 'complete' && missionItemsMatchReadback(lastUploadMissionItems, items)) {
+      completeMissionWrite('readback-match');
+    } else if (store.getMissionState().status === 'uploading') {
+      store.setMissionStatus('idle');
+      pendingMissionItems = [];
+      broadcast('mission.uploaded', { success: false, result: 'readback-mismatch' });
+      console.log('Mission write failed: readback mismatch');
+    }
+  }
+}
+
+function clearMissionReadbackTimer(): void {
+  if (!missionReadbackTimer) return;
+  clearTimeout(missionReadbackTimer);
+  missionReadbackTimer = null;
+}
+
+function completeMissionWrite(source: string): void {
+  const items = lastUploadMissionItems.length > 0 ? lastUploadMissionItems : pendingMissionItems;
+  missionUploadInProgress = false;
+  pendingMissionItems = [];
+  store.setMissionWaypoints(items);
+  store.setMissionStatus('ready');
+  broadcast('mission.uploaded', { success: true, source });
+  console.log(`Mission waypoints written successfully via ${source}; ready to start`);
+}
+
+function missionItemsMatchReadback(expected: MissionItem[], actual: ParsedMissionItem[]): boolean {
+  if (expected.length === 0 || actual.length !== expected.length) return false;
+  const bySeq = new Map(actual.map((item) => [item.seq, item]));
+  for (let seq = 0; seq < expected.length; seq += 1) {
+    const expectedItem = expected[seq];
+    const actualItem = bySeq.get(seq);
+    if (!actualItem) return false;
+    if (expectedItem.type === 'doJump') {
+      if (actualItem.command !== 177) return false;
+      if (Math.round(actualItem.param1) !== expectedItem.target) return false;
+      if (Math.round(actualItem.param2) !== expectedItem.repeat) return false;
+      continue;
+    }
+    if (actualItem.command !== 16) return false;
+    if (expectedItem.type === 'home') continue;
+    if (Math.abs(actualItem.lat - expectedItem.lat) > 0.00001) return false;
+    if (Math.abs(actualItem.lng - expectedItem.lng) > 0.00001) return false;
+  }
+  return true;
 }
 
 function handleMissionAck(type: number, result: number): void {
   if (!missionUploadInProgress) return;
+  clearMissionUploadTimers();
 
   if (type === 0 && result === 0) { // MAV_MISSION_ACCEPTED
-    missionUploadInProgress = false;
-    store.setMissionWaypoints(pendingMissionItems);
-    store.setMissionStatus('active');
-    const state = store.getState();
-    if (state.remote) {
-      udp.send(buildMissionSetCurrent(state.systemId, state.componentId || 1, 0), state.remote.port, state.remote.address);
-      for (const frame of buildSetMode(state.systemId, state.componentId || 1, 'mission', state.autopilot)) {
-        udp.send(frame, state.remote.port, state.remote.address);
-      }
-    }
-    pendingMissionItems = [];
-    broadcast('mission.uploaded', { success: true });
-    console.log('Mission uploaded successfully');
+    completeMissionWrite('mission-ack');
+    startMissionReadback('upload-ack');
   } else {
     missionUploadInProgress = false;
+    pendingMissionItems = [];
+    store.setMissionStatus('idle');
     broadcast('mission.uploaded', { success: false, result });
     console.log(`Mission upload failed: type=${type} result=${result}`);
+    startMissionReadback(`upload-ack-failed-${result}`);
   }
 }
 
@@ -200,32 +367,76 @@ function uploadMission(waypoints: Waypoint[], loopCount = 1): { ok: boolean; mes
   if (!state.online || !state.remote) return { ok: false, message: 'USV offline' };
   if (waypoints.length === 0) return { ok: false, message: 'No waypoints' };
 
-  const missionItems = buildMissionItems(waypoints, loopCount);
+  const missionItems = buildMissionItems(waypoints, loopCount, state);
   const remote = state.remote;
-  missionUploadInProgress = true;
+  missionUploadInProgress = false;
   pendingMissionItems = missionItems;
+  lastUploadMissionItems = missionItems;
   store.setMissionStatus('uploading');
 
-  const countFrame = buildMissionCount(state.systemId, state.componentId || 1, missionItems.length);
-  udp.send(countFrame, remote.port, remote.address);
-  console.log(`Uploading mission with ${missionItems.length} items (${waypoints.length} waypoints, loop=${loopCount})`);
+  clearMissionUploadTimers();
+  sendMissionFrame(buildMissionClearAll(state.systemId, state.componentId || 1), 'MISSION_CLEAR_ALL before upload');
+  console.log(`Clearing existing mission before upload (${missionItems.length} new items)`);
+  missionUploadStartTimer = setTimeout(() => {
+    missionUploadStartTimer = null;
+    if (pendingMissionItems !== missionItems) return;
+    missionUploadInProgress = true;
+    startMissionUploadTimeout();
+    const countFrame = buildMissionCount(state.systemId, state.componentId || 1, missionItems.length);
+    sendMissionFrame(countFrame, `MISSION_COUNT count=${missionItems.length}`);
+    console.log(`Uploading mission with ${missionItems.length} items (${waypoints.length} waypoints, loop=${loopCount})`);
+  }, MISSION_CLEAR_BEFORE_UPLOAD_DELAY_MS);
 
   return { ok: true, message: 'Mission upload started' };
 }
 
-function buildMissionItems(waypoints: Waypoint[], loopCount: number): MissionItem[] {
+function startMissionUploadTimeout(): void {
+  clearMissionUploadTimeout();
+  missionUploadTimer = setTimeout(() => {
+    if (!missionUploadInProgress) return;
+    missionUploadInProgress = false;
+    console.log(`Mission upload timeout after ${MISSION_UPLOAD_TIMEOUT_MS}ms waiting for MISSION_ACK`);
+    startMissionReadback('upload-timeout');
+  }, MISSION_UPLOAD_TIMEOUT_MS);
+}
+
+function clearMissionUploadTimers(): void {
+  if (missionUploadStartTimer) {
+    clearTimeout(missionUploadStartTimer);
+    missionUploadStartTimer = null;
+  }
+  clearMissionUploadTimeout();
+}
+
+function clearMissionUploadTimeout(): void {
+  if (!missionUploadTimer) return;
+  clearTimeout(missionUploadTimer);
+  missionUploadTimer = null;
+}
+
+function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvState): MissionItem[] {
   const sanitizedLoopCount = Math.max(1, Math.min(10, Math.round(loopCount || 1)));
-  const items: MissionItem[] = waypoints.map((point, index) => ({
+  const homeLat = state.lat ?? waypoints[0].lat;
+  const homeLng = state.lng ?? waypoints[0].lng;
+  const items: MissionItem[] = [{
+    type: 'home',
+    order: 0,
+    lat: homeLat,
+    lng: homeLng,
+    altitude: state.gpsAltitude ?? 0
+  }];
+
+  items.push(...waypoints.map((point, index) => ({
     ...point,
     order: index + 1,
-    type: 'waypoint'
-  }));
+    type: 'waypoint' as const
+  })));
 
   if (sanitizedLoopCount > 1 && waypoints.length > 0) {
     items.push({
       type: 'doJump',
       order: items.length + 1,
-      target: 0,
+      target: 1,
       repeat: sanitizedLoopCount - 1
     });
   }
@@ -239,11 +450,28 @@ function pauseMission(): { ok: boolean; message: string } {
 
   // 切换到 HOLD 模式暂停任务
   for (const frame of buildSetMode(state.systemId, state.componentId || 1, 'hold', state.autopilot)) {
-    udp.send(frame, state.remote.port, state.remote.address);
+    sendMissionFrame(frame, 'SET_MODE hold');
   }
   store.setMissionStatus('paused');
   broadcast('mission.paused', {});
   return { ok: true, message: 'Mission paused' };
+}
+
+function startMission(): { ok: boolean; message: string } {
+  const state = store.getState();
+  if (!state.online || !state.remote) return { ok: false, message: 'USV offline' };
+  const mission = store.getMissionState();
+  if (mission.totalWaypoints <= 1 || mission.status !== 'ready') {
+    return { ok: false, message: 'Mission waypoints are not ready' };
+  }
+
+  sendMissionFrame(buildMissionSetCurrent(state.systemId, state.componentId || 1, 1), 'MISSION_SET_CURRENT seq=1');
+  for (const frame of buildSetMode(state.systemId, state.componentId || 1, 'mission', state.autopilot)) {
+    sendMissionFrame(frame, 'SET_MODE mission');
+  }
+  store.setMissionStatus('active');
+  broadcast('mission.started', {});
+  return { ok: true, message: 'Mission started' };
 }
 
 function resumeMission(): { ok: boolean; message: string } {
@@ -252,7 +480,7 @@ function resumeMission(): { ok: boolean; message: string } {
 
   // 切换回 AUTO 模式继续任务
   for (const frame of buildSetMode(state.systemId, state.componentId || 1, 'mission', state.autopilot)) {
-    udp.send(frame, state.remote.port, state.remote.address);
+    sendMissionFrame(frame, 'SET_MODE mission');
   }
   store.setMissionStatus('active');
   broadcast('mission.resumed', {});
@@ -264,10 +492,21 @@ function clearMission(): { ok: boolean; message: string } {
   if (!state.online || !state.remote) return { ok: false, message: 'USV offline' };
 
   const frame = buildMissionClearAll(state.systemId, state.componentId || 1);
-  udp.send(frame, state.remote.port, state.remote.address);
+  missionUploadInProgress = false;
+  pendingMissionItems = [];
+  lastUploadMissionItems = [];
+  clearMissionUploadTimers();
+  sendMissionFrame(frame, 'MISSION_CLEAR_ALL');
   store.clearMission();
   broadcast('mission.cleared', {});
   return { ok: true, message: 'Mission cleared' };
+}
+
+function requestMissionReadback(reason: string): { ok: boolean; message: string } {
+  const state = store.getState();
+  if (!state.online || !state.remote) return { ok: false, message: 'USV offline' };
+  startMissionReadback(reason);
+  return { ok: true, message: 'Mission readback requested' };
 }
 
 const httpServer = http.createServer(async (req, res) => {
@@ -283,12 +522,18 @@ const httpServer = http.createServer(async (req, res) => {
 
   if (url.pathname === '/api/mission/upload' && req.method === 'POST') {
     const body = await readBody(req) as { waypoints?: Waypoint[]; loopCount?: number };
+    console.log(`HTTP mission upload requested: waypoints=${body.waypoints?.length ?? 0}, loop=${body.loopCount ?? 1}`);
     const result = uploadMission(body.waypoints || [], body.loopCount);
     return sendJson(res, result.ok ? 200 : 400, result);
   }
 
   if (url.pathname === '/api/mission/pause' && req.method === 'POST') {
     const result = pauseMission();
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
+  if (url.pathname === '/api/mission/start' && req.method === 'POST') {
+    const result = startMission();
     return sendJson(res, result.ok ? 200 : 400, result);
   }
 
@@ -299,6 +544,11 @@ const httpServer = http.createServer(async (req, res) => {
 
   if (url.pathname === '/api/mission/clear' && req.method === 'POST') {
     const result = clearMission();
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
+  if (url.pathname === '/api/mission/readback' && req.method === 'POST') {
+    const result = requestMissionReadback('manual-api');
     return sendJson(res, result.ok ? 200 : 400, result);
   }
 
@@ -341,12 +591,17 @@ wss.on('connection', (ws) => {
       // 航线控制
       if (message.type === 'mission.upload') {
         const data = message.data as { waypoints?: Waypoint[]; loopCount?: number };
+        console.log(`WS mission upload requested: waypoints=${data.waypoints?.length ?? 0}, loop=${data.loopCount ?? 1}`);
         const result = uploadMission(data.waypoints || [], data.loopCount);
         sendWs(ws, 'mission.upload', result);
       }
       if (message.type === 'mission.pause') {
         const result = pauseMission();
         sendWs(ws, 'mission.pause', result);
+      }
+      if (message.type === 'mission.start') {
+        const result = startMission();
+        sendWs(ws, 'mission.start', result);
       }
       if (message.type === 'mission.resume') {
         const result = resumeMission();
@@ -398,7 +653,10 @@ function handleControl(body: unknown): { ok: boolean; message: string } {
 
 function sendSetMode(mode: unknown): { ok: boolean; message: string } {
   const modeKey = String(mode);
-  if (!['manual', 'hold', 'mission', 'rtl', 'posctl', 'stabilized'].includes(modeKey)) {
+  if (modeKey === 'mission') {
+    return { ok: false, message: 'mission mode is only allowed after mission upload/resume' };
+  }
+  if (!['manual', 'hold', 'rtl', 'posctl', 'stabilized'].includes(modeKey)) {
     return { ok: false, message: 'unknown mode' };
   }
 

@@ -46,7 +46,7 @@ export type Waypoint = {
 };
 
 export type MissionItem =
-  | (Waypoint & { type?: 'waypoint' })
+  | (Waypoint & { type?: 'waypoint' | 'home'; altitude?: number })
   | {
       type: 'doJump';
       order: number;
@@ -55,7 +55,7 @@ export type MissionItem =
     };
 
 export type MissionState = {
-  status: 'idle' | 'uploading' | 'active' | 'paused' | 'completed';
+  status: 'idle' | 'uploading' | 'ready' | 'active' | 'paused' | 'completed';
   waypoints: MissionItem[];
   currentWaypoint: number;
   totalWaypoints: number;

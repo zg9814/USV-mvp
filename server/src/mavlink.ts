@@ -6,8 +6,11 @@ export type MavlinkFrame = {
   componentId: number;
   messageId: number;
   payload: Buffer;
+  raw: Buffer;
+  version: 1 | 2;
 };
 
+const MAVLINK1_MAGIC = 0xfe;
 const MAVLINK2_MAGIC = 0xfd;
 const SERVER_SYSTEM_ID = 255;
 const SERVER_COMPONENT_ID = 190;
@@ -19,9 +22,11 @@ const CRC_EXTRA = new Map<number, number>([
   [24, 24],
   [25, 23],
   [33, 104],
+  [39, 254],
   [40, 230],
   [41, 28],
   [42, 28],
+  [43, 132],
   [44, 221],
   [45, 232],
   [46, 11],
@@ -71,9 +76,36 @@ export function decodeFrames(input: Buffer): MavlinkFrame[] {
   let offset = 0;
 
   while (offset < input.length) {
-    const magicAt = input.indexOf(MAVLINK2_MAGIC, offset);
-    if (magicAt === -1) break;
+    const mavlink1At = input.indexOf(MAVLINK1_MAGIC, offset);
+    const mavlink2At = input.indexOf(MAVLINK2_MAGIC, offset);
+    const magicAt = [mavlink1At, mavlink2At].filter((value) => value >= 0).sort((a, b) => a - b)[0];
+    if (magicAt === undefined) break;
     offset = magicAt;
+
+    const magic = input[offset];
+    if (magic === MAVLINK1_MAGIC) {
+      if (input.length - offset < 8) break;
+      const length = input[offset + 1];
+      const frameLength = 6 + length + 2;
+      if (input.length - offset < frameLength) break;
+      const raw = input.subarray(offset, offset + frameLength);
+      const payload = raw.subarray(6, 6 + length);
+      const messageId = raw[5];
+      const expected = raw.readUInt16LE(6 + length);
+      if (validateChecksum(raw.subarray(1, 6 + length), messageId, expected)) {
+        frames.push({
+          sequence: raw[2],
+          systemId: raw[3],
+          componentId: raw[4],
+          messageId,
+          payload,
+          raw,
+          version: 1
+        });
+      }
+      offset += frameLength;
+      continue;
+    }
 
     if (input.length - offset < 12) break;
 
@@ -85,7 +117,7 @@ export function decodeFrames(input: Buffer): MavlinkFrame[] {
 
     const raw = input.subarray(offset, offset + frameLength);
     const payload = raw.subarray(10, 10 + length);
-    const messageId = raw[offsetRelative(7)] | (raw[offsetRelative(8)] << 8) | (raw[offsetRelative(9)] << 16);
+    const messageId = raw[7] | (raw[8] << 8) | (raw[9] << 16);
     const expected = raw.readUInt16LE(10 + length);
 
     if (validateChecksum(raw.subarray(1, 10 + length), messageId, expected)) {
@@ -94,7 +126,9 @@ export function decodeFrames(input: Buffer): MavlinkFrame[] {
         systemId: raw[5],
         componentId: raw[6],
         messageId,
-        payload
+        payload,
+        raw,
+        version: 2
       });
     }
 
@@ -102,10 +136,6 @@ export function decodeFrames(input: Buffer): MavlinkFrame[] {
   }
 
   return frames;
-
-  function offsetRelative(index: number): number {
-    return index;
-  }
 }
 
 export function buildManualControl(targetSystem: number, input: ManualControlInput): Buffer {
@@ -500,7 +530,56 @@ export function buildMissionCount(targetSystem: number, targetComponent: number,
   return buildFrame(44, payload);
 }
 
+export function buildMissionRequestList(targetSystem: number, targetComponent: number): Buffer {
+  const MAV_MISSION_TYPE_MISSION = 0;
+  const payload = Buffer.alloc(3);
+  payload.writeUInt8(targetSystem, 0);
+  payload.writeUInt8(targetComponent, 1);
+  payload.writeUInt8(MAV_MISSION_TYPE_MISSION, 2);
+  return buildFrame(43, payload);
+}
+
+export function buildMissionRequestInt(targetSystem: number, targetComponent: number, sequence: number): Buffer {
+  const MAV_MISSION_TYPE_MISSION = 0;
+  const payload = Buffer.alloc(5);
+  payload.writeUInt16LE(sequence, 0);
+  payload.writeUInt8(targetSystem, 2);
+  payload.writeUInt8(targetComponent, 3);
+  payload.writeUInt8(MAV_MISSION_TYPE_MISSION, 4);
+  return buildFrame(51, payload);
+}
+
 export function buildMissionItemInt(
+  targetSystem: number,
+  targetComponent: number,
+  sequence: number,
+  lat: number,
+  lng: number,
+  altitude: number = 0,
+  command: number = 16,
+  frame: number = 6
+): Buffer {
+  const MAV_MISSION_TYPE_MISSION = 0;
+  const payload = Buffer.alloc(38);
+  payload.writeFloatLE(0, 0);             // param1: hold time
+  payload.writeFloatLE(0, 4);             // param2: acceptance radius (use vehicle default)
+  payload.writeFloatLE(0, 8);             // param3: pass radius
+  payload.writeFloatLE(0, 12);            // param4: yaw
+  payload.writeInt32LE(Math.round(lat * 1e7), 16);  // x (lat)
+  payload.writeInt32LE(Math.round(lng * 1e7), 20);  // y (lng)
+  payload.writeFloatLE(altitude, 24);     // z (altitude)
+  payload.writeUInt16LE(sequence, 28);     // seq
+  payload.writeUInt16LE(command, 30);      // command (MAV_CMD_NAV_WAYPOINT)
+  payload.writeUInt8(targetSystem, 32);
+  payload.writeUInt8(targetComponent, 33);
+  payload.writeUInt8(frame, 34);
+  payload.writeUInt8(0, 35);              // current: false while uploading mission items
+  payload.writeUInt8(1, 36);              // autocontinue
+  payload.writeUInt8(MAV_MISSION_TYPE_MISSION, 37);
+  return buildFrame(73, payload);
+}
+
+export function buildMissionItem(
   targetSystem: number,
   targetComponent: number,
   sequence: number,
@@ -509,25 +588,25 @@ export function buildMissionItemInt(
   altitude: number = 0,
   command: number = 16
 ): Buffer {
-  const MAV_FRAME_GLOBAL_RELATIVE_ALT_INT = 6;
+  const MAV_FRAME_GLOBAL_RELATIVE_ALT = 3;
   const MAV_MISSION_TYPE_MISSION = 0;
   const payload = Buffer.alloc(38);
-  payload.writeFloatLE(altitude, 0);      // param1
-  payload.writeFloatLE(0, 4);             // param2
-  payload.writeFloatLE(0, 8);             // param3
-  payload.writeFloatLE(0, 12);            // param4
-  payload.writeInt32LE(Math.round(lat * 1e7), 16);  // x (lat)
-  payload.writeInt32LE(Math.round(lng * 1e7), 20);  // y (lng)
+  payload.writeFloatLE(0, 0);             // param1: hold time
+  payload.writeFloatLE(0, 4);             // param2: acceptance radius (use vehicle default)
+  payload.writeFloatLE(0, 8);             // param3: pass radius
+  payload.writeFloatLE(0, 12);            // param4: yaw
+  payload.writeFloatLE(lat, 16);          // x (lat)
+  payload.writeFloatLE(lng, 20);          // y (lng)
   payload.writeFloatLE(altitude, 24);     // z (altitude)
-  payload.writeUInt16LE(sequence, 28);     // seq
-  payload.writeUInt16LE(command, 30);      // command (MAV_CMD_NAV_WAYPOINT)
+  payload.writeUInt16LE(sequence, 28);    // seq
+  payload.writeUInt16LE(command, 30);     // command (MAV_CMD_NAV_WAYPOINT)
   payload.writeUInt8(targetSystem, 32);
   payload.writeUInt8(targetComponent, 33);
-  payload.writeUInt8(MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, 34);
-  payload.writeUInt8(sequence === 0 ? 1 : 0, 35);
+  payload.writeUInt8(MAV_FRAME_GLOBAL_RELATIVE_ALT, 34);
+  payload.writeUInt8(0, 35);              // current: false while uploading mission items
   payload.writeUInt8(1, 36);              // autocontinue
   payload.writeUInt8(MAV_MISSION_TYPE_MISSION, 37);
-  return buildFrame(73, payload);
+  return buildFrame(39, payload);
 }
 
 export function buildMissionDoJumpInt(
@@ -559,6 +638,35 @@ export function buildMissionDoJumpInt(
   return buildFrame(73, payload);
 }
 
+export function buildMissionDoJump(
+  targetSystem: number,
+  targetComponent: number,
+  sequence: number,
+  targetSequence: number,
+  repeat: number
+): Buffer {
+  const MAV_FRAME_MISSION = 2;
+  const MAV_CMD_DO_JUMP = 177;
+  const MAV_MISSION_TYPE_MISSION = 0;
+  const payload = Buffer.alloc(38);
+  payload.writeFloatLE(targetSequence, 0); // param1: target waypoint seq
+  payload.writeFloatLE(repeat, 4);         // param2: repeat count, -1 = infinite
+  payload.writeFloatLE(0, 8);
+  payload.writeFloatLE(0, 12);
+  payload.writeFloatLE(0, 16);
+  payload.writeFloatLE(0, 20);
+  payload.writeFloatLE(0, 24);
+  payload.writeUInt16LE(sequence, 28);
+  payload.writeUInt16LE(MAV_CMD_DO_JUMP, 30);
+  payload.writeUInt8(targetSystem, 32);
+  payload.writeUInt8(targetComponent, 33);
+  payload.writeUInt8(MAV_FRAME_MISSION, 34);
+  payload.writeUInt8(0, 35);
+  payload.writeUInt8(1, 36);
+  payload.writeUInt8(MAV_MISSION_TYPE_MISSION, 37);
+  return buildFrame(39, payload);
+}
+
 export function buildMissionClearAll(targetSystem: number, targetComponent: number): Buffer {
   const payload = Buffer.alloc(3);
   payload.writeUInt8(targetSystem, 0);
@@ -575,10 +683,76 @@ export function buildMissionSetCurrent(targetSystem: number, targetComponent: nu
   return buildFrame(41, payload);
 }
 
+export function buildMissionAck(targetSystem: number, targetComponent: number, result = 0): Buffer {
+  const MAV_MISSION_TYPE_MISSION = 0;
+  const payload = Buffer.alloc(4);
+  payload.writeUInt8(targetSystem, 0);
+  payload.writeUInt8(targetComponent, 1);
+  payload.writeUInt8(result, 2);
+  payload.writeUInt8(MAV_MISSION_TYPE_MISSION, 3);
+  return buildFrame(47, payload);
+}
+
+export function parseMissionCount(payload: Buffer): { count: number; missionType: number } | null {
+  if (payload.length < 4) return null;
+  return {
+    count: payload.readUInt16LE(0),
+    missionType: payload.length >= 5 ? payload.readUInt8(4) : 0
+  };
+}
+
 export function parseMissionRequest(payload: Buffer): { sequence: number } | null {
   if (payload.length < 4) return null;
   return {
     sequence: payload.readUInt16LE(0)
+  };
+}
+
+export type ParsedMissionItem = {
+  seq: number;
+  command: number;
+  frame: number;
+  current: number;
+  autocontinue: number;
+  missionType: number;
+  param1: number;
+  param2: number;
+  lat: number;
+  lng: number;
+  altitude: number;
+};
+
+export function parseMissionItemInt(payload: Buffer): ParsedMissionItem | null {
+  if (payload.length < 37) return null;
+  return {
+    seq: payload.readUInt16LE(28),
+    command: payload.readUInt16LE(30),
+    frame: payload.readUInt8(34),
+    current: payload.readUInt8(35),
+    autocontinue: payload.readUInt8(36),
+    missionType: payload.length >= 38 ? payload.readUInt8(37) : 0,
+    param1: payload.readFloatLE(0),
+    param2: payload.readFloatLE(4),
+    lat: payload.readInt32LE(16) / 1e7,
+    lng: payload.readInt32LE(20) / 1e7,
+    altitude: payload.readFloatLE(24)
+  };
+}
+
+export function parseMissionItem(payload: Buffer): ParsedMissionItem | null {
+  if (payload.length < 37) return null;
+  return {
+    seq: payload.readUInt16LE(28),
+    command: payload.readUInt16LE(30),
+    frame: payload.readUInt8(34),
+    current: payload.readUInt8(35),
+    autocontinue: payload.readUInt8(36),
+    missionType: payload.length >= 38 ? payload.readUInt8(37) : 0,
+    param1: payload.readFloatLE(0),
+    param2: payload.readFloatLE(4),
+    lat: payload.readFloatLE(16),
+    lng: payload.readFloatLE(20),
+    altitude: payload.readFloatLE(24)
   };
 }
 
