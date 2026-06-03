@@ -114,8 +114,10 @@ const joystick = reactive({
 const pressed = reactive(new Set<string>());
 const track = ref<TrackPoint[]>([]);
 const waypoints = ref<Waypoint[]>([]);
-const planningEnabled = ref(true);
+const planningEnabled = ref(false);
 const mapLayerMode = ref<'vector' | 'satellite'>('vector');
+const mapDisplayScale = ref(1);
+const mapDisplayScales = [1, 1.5, 2];
 const mission = reactive<MissionState>({
   status: 'idle',
   waypoints: [],
@@ -144,6 +146,11 @@ let waypointMarkers: any[] = [];
 let hasCenteredMap = false;
 let satelliteLayer: any = null;
 let satelliteLabelLayer: any = null;
+let tiandituLoadPromise: Promise<any> | null = null;
+let mapInitPromise: Promise<void> | null = null;
+let mapPointerStart: { x: number; y: number } | null = null;
+let suppressNextMapClick = false;
+let mapImageObserver: MutationObserver | null = null;
 
 const voltageLabel = computed(() => state.voltage == null ? '--' : `${state.voltage.toFixed(2)} V`);
 const speedLabel = computed(() => state.speed == null ? '--' : `${state.speed.toFixed(2)} m/s`);
@@ -185,6 +192,13 @@ onMounted(() => {
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('blur', zeroControl);
+  document.addEventListener('pointerdown', onDocumentMapPointerDown, true);
+  document.addEventListener('pointermove', onDocumentMapPointerMove, true);
+  document.addEventListener('pointerup', onDocumentMapPointerUp, true);
+  document.addEventListener('pointercancel', onDocumentMapPointerCancel, true);
+  document.addEventListener('mousedown', onDocumentMapPointerDown, true);
+  document.addEventListener('mousemove', onDocumentMapPointerMove, true);
+  document.addEventListener('mouseup', onDocumentMapPointerUp, true);
   initializeMap();
   controlTimer = window.setInterval(() => {
     pruneTrack();
@@ -202,6 +216,22 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown);
   window.removeEventListener('keyup', onKeyUp);
   window.removeEventListener('blur', zeroControl);
+  document.removeEventListener('pointerdown', onDocumentMapPointerDown, true);
+  document.removeEventListener('pointermove', onDocumentMapPointerMove, true);
+  document.removeEventListener('pointerup', onDocumentMapPointerUp, true);
+  document.removeEventListener('pointercancel', onDocumentMapPointerCancel, true);
+  document.removeEventListener('mousedown', onDocumentMapPointerDown, true);
+  document.removeEventListener('mousemove', onDocumentMapPointerMove, true);
+  document.removeEventListener('mouseup', onDocumentMapPointerUp, true);
+  mapContainer?.removeEventListener('pointerdown', onMapPointerDown, true);
+  mapContainer?.removeEventListener('pointermove', onMapPointerMove, true);
+  mapContainer?.removeEventListener('pointerup', onMapPointerUp, true);
+  mapContainer?.removeEventListener('pointercancel', onMapPointerCancel, true);
+  mapContainer?.removeEventListener('mousedown', onMapPointerDown, true);
+  mapContainer?.removeEventListener('mousemove', onMapPointerMove, true);
+  mapContainer?.removeEventListener('mouseup', onMapPointerUp, true);
+  mapContainer?.removeEventListener('dragstart', onMapDragStart);
+  mapImageObserver?.disconnect();
   resetJoystick();
 });
 
@@ -402,35 +432,72 @@ function applyDeadzone(value: number) {
 }
 
 function bindMap(el: HTMLDivElement | null) {
+  if (mapContainer) {
+    mapContainer.removeEventListener('pointerdown', onMapPointerDown, true);
+    mapContainer.removeEventListener('pointermove', onMapPointerMove, true);
+    mapContainer.removeEventListener('pointerup', onMapPointerUp, true);
+    mapContainer.removeEventListener('pointercancel', onMapPointerCancel, true);
+    mapContainer.removeEventListener('mousedown', onMapPointerDown, true);
+    mapContainer.removeEventListener('mousemove', onMapPointerMove, true);
+    mapContainer.removeEventListener('mouseup', onMapPointerUp, true);
+  }
   mapContainer = el;
+  mapContainer?.addEventListener('pointerdown', onMapPointerDown, true);
+  mapContainer?.addEventListener('pointermove', onMapPointerMove, true);
+  mapContainer?.addEventListener('pointerup', onMapPointerUp, true);
+  mapContainer?.addEventListener('pointercancel', onMapPointerCancel, true);
+  mapContainer?.addEventListener('mousedown', onMapPointerDown, true);
+  mapContainer?.addEventListener('mousemove', onMapPointerMove, true);
+  mapContainer?.addEventListener('mouseup', onMapPointerUp, true);
+  mapContainer?.addEventListener('dragstart', onMapDragStart);
   initializeMap();
 }
 
 function loadTianditu() {
   if (window.T) return Promise.resolve(window.T);
+  if (tiandituLoadPromise) return tiandituLoadPromise;
 
-  return new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = `https://api.tianditu.gov.cn/api?v=4.0&tk=${TIANDITU_KEY}`;
-    script.async = true;
-    script.onload = () => {
+  tiandituLoadPromise = new Promise((resolve, reject) => {
+    const script = (document.getElementById('tianditu-js-api') as HTMLScriptElement | null) ?? document.createElement('script');
+    const onError = () => {
+      tiandituLoadPromise = null;
+      mapStatusText.value = '天地图脚本加载失败';
+      reject(new Error('天地图加载失败'));
+    };
+    const onLoad = () => {
       if (window.T) {
         mapStatusText.value = '天地图已加载';
         resolve(window.T);
       } else {
+        tiandituLoadPromise = null;
         mapStatusText.value = '天地图加载失败';
         reject(new Error('天地图加载失败'));
       }
     };
-    script.onerror = () => {
-      mapStatusText.value = '天地图脚本加载失败';
-      reject(new Error('天地图加载失败'));
-    };
-    document.head.appendChild(script);
+
+    script.id = 'tianditu-js-api';
+    script.src = `https://api.tianditu.gov.cn/api?v=4.0&tk=${TIANDITU_KEY}`;
+    script.async = true;
+    script.addEventListener('load', onLoad, { once: true });
+    script.addEventListener('error', onError, { once: true });
+    if (!script.parentElement) document.head.appendChild(script);
   });
+
+  return tiandituLoadPromise;
 }
 
 async function initializeMap() {
+  if (!mapContainer || map) return;
+  if (mapInitPromise) return mapInitPromise;
+
+  mapInitPromise = initializeMapOnce().finally(() => {
+    mapInitPromise = null;
+  });
+
+  return mapInitPromise;
+}
+
+async function initializeMapOnce() {
   if (!mapContainer || map) return;
 
   try {
@@ -440,9 +507,15 @@ async function initializeMap() {
     return;
   }
 
+  if (!mapContainer || map) return;
+
   const T = window.T;
+  mapContainer.replaceChildren();
   map = new T.Map(mapContainer);
   map.centerAndZoom(new T.LngLat(121.04708, 31.2792), 16);
+  map.enableDrag?.();
+  map.enableScrollWheelZoom?.();
+  map.enableKeyboard?.();
 
   // 创建卫星图层（影像底图 + 影像注记）
   satelliteLayer = new T.TileLayer(`http://t0.tianditu.gov.cn/img_w/wmts?tk=${TIANDITU_KEY}&SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=img&STYLE=default&TILEMATRIXSET=w&FORMAT=tiles&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}`);
@@ -464,7 +537,7 @@ async function initializeMap() {
   });
   map.addOverLay(routeLine);
 
-  map.addEventListener('click', handleMapClick);
+  setupMapPointerBehavior();
   showDebugShipMarker();
   updateMapOverlays();
   updateRouteOverlays();
@@ -473,6 +546,12 @@ async function initializeMap() {
 function setMapLayer(mode: 'vector' | 'satellite') {
   mapLayerMode.value = mode;
   updateMapLayers();
+}
+
+function setMapDisplayScale(scale: number) {
+  mapDisplayScale.value = scale;
+  updateRouteOverlays();
+  updateMapOverlays();
 }
 
 function updateMapLayers() {
@@ -534,26 +613,119 @@ function updateRouteOverlays() {
   routeLine.setLngLats(path);
 
   for (const marker of waypointMarkers) map.removeOverLay(marker);
-  waypointMarkers = waypoints.value.map((point) => {
-    const marker = new T.Marker(new T.LngLat(point.lng, point.lat));
-    marker.bindInfoWindow(new T.InfoWindow(`<div class="waypoint-marker">${point.order}</div>`, { offset: new T.Point(0, 0) }));
-    return marker;
+  waypointMarkers = [];
+
+  waypoints.value.forEach((point) => {
+    const position = new T.LngLat(point.lng, point.lat);
+    const dotSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">
+      <circle cx="6" cy="6" r="5" fill="#2563eb" stroke="white" stroke-width="2"/>
+    </svg>`;
+    const dotIcon = new T.Icon({
+      iconUrl: 'data:image/svg+xml,' + encodeURIComponent(dotSvg),
+      iconSize: new T.Point(12, 12),
+      iconAnchor: new T.Point(6, 6)
+    });
+    const dotMarker = new T.Marker(position, { icon: dotIcon });
+
+    const labelSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="18" viewBox="0 0 24 18">
+      <rect x="0" y="0" width="24" height="18" rx="4" fill="#2563eb"/>
+      <text x="12" y="13" text-anchor="middle" fill="white" font-size="12" font-weight="bold" font-family="Arial">${point.order}</text>
+    </svg>`;
+    const labelIcon = new T.Icon({
+      iconUrl: 'data:image/svg+xml,' + encodeURIComponent(labelSvg),
+      iconSize: new T.Point(24, 18),
+      iconAnchor: new T.Point(-8, -8)
+    });
+    const labelMarker = new T.Marker(position, { icon: labelIcon });
+
+    waypointMarkers.push(dotMarker, labelMarker);
+    map.addOverLay(dotMarker);
+    map.addOverLay(labelMarker);
   });
-  for (const marker of waypointMarkers) map.addOverLay(marker);
 }
 
-function handleMapClick(event: any) {
-  if (!planningEnabled.value || !event.lnglat) return;
-  const lnglat = event.lnglat || event.lngLat;
-  if (!lnglat) return;
+function addWaypoint(lnglat: any) {
   waypoints.value = [
     ...waypoints.value,
     {
-      lng: lnglat.lng || lnglat.getLng(),
-      lat: lnglat.lat || lnglat.getLat(),
+      lng: lnglat.lng ?? lnglat.getLng(),
+      lat: lnglat.lat ?? lnglat.getLat(),
       order: waypoints.value.length + 1
     }
   ];
+}
+
+function getMapClickLngLat(event: MouseEvent | PointerEvent) {
+  if (!map || !mapContainer) return null;
+
+  const tileLngLat = screenPointToLngLatFromTiles(event.clientX, event.clientY);
+  if (tileLngLat) return tileLngLat;
+
+  const mapRect = mapContainer.getBoundingClientRect();
+  const scale = mapDisplayScale.value;
+  const correctedX = (event.clientX - mapRect.left) / scale;
+  const correctedY = (event.clientY - mapRect.top) / scale;
+
+  return map.containerPointToLngLat?.([correctedX, correctedY])
+    || map.vW?.([correctedX, correctedY])
+    || containerPointToLngLatByMercator(correctedX, correctedY);
+}
+
+function screenPointToLngLatFromTiles(clientX: number, clientY: number) {
+  if (!mapContainer) return null;
+
+  const tiles = Array.from(mapContainer.querySelectorAll<HTMLImageElement>('.tdt-tile'));
+  for (const tile of tiles) {
+    const rect = tile.getBoundingClientRect();
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) continue;
+
+    const src = tile.getAttribute('src') || '';
+    const col = Number(src.match(/TILECOL=(\d+)/)?.[1]);
+    const row = Number(src.match(/TILEROW=(\d+)/)?.[1]);
+    const zoom = Number(src.match(/TILEMATRIX=(\d+)/)?.[1]);
+    if (!Number.isFinite(col) || !Number.isFinite(row) || !Number.isFinite(zoom)) continue;
+
+    const localX = ((clientX - rect.left) / rect.width) * 256;
+    const localY = ((clientY - rect.top) / rect.height) * 256;
+    return worldPixelToLngLat(col * 256 + localX, row * 256 + localY, 256 * 2 ** zoom);
+  }
+
+  return null;
+}
+
+function containerPointToLngLatByMercator(x: number, y: number) {
+  if (!map || !mapContainer) return null;
+
+  const center = map.getCenter?.();
+  const zoom = map.getZoom?.();
+  if (!center || typeof zoom !== 'number') return null;
+
+  const centerLng = center.lng ?? center.getLng?.();
+  const centerLat = center.lat ?? center.getLat?.();
+  if (typeof centerLng !== 'number' || typeof centerLat !== 'number') return null;
+
+  const mapRect = mapContainer.getBoundingClientRect();
+  const scale = 256 * 2 ** zoom;
+  const centerWorld = lngLatToWorldPixel(centerLng, centerLat, scale);
+  const worldX = centerWorld.x + x - mapRect.width / 2;
+  const worldY = centerWorld.y + y - mapRect.height / 2;
+
+  return worldPixelToLngLat(worldX, worldY, scale);
+}
+
+function lngLatToWorldPixel(lng: number, lat: number, scale: number) {
+  const sinLat = Math.sin((lat * Math.PI) / 180);
+  return {
+    x: ((lng + 180) / 360) * scale,
+    y: (0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI)) * scale
+  };
+}
+
+function worldPixelToLngLat(x: number, y: number, scale: number) {
+  const lng = (x / scale) * 360 - 180;
+  const n = Math.PI - (2 * Math.PI * y) / scale;
+  const lat = (180 / Math.PI) * Math.atan(Math.sinh(n));
+  return { lng, lat };
 }
 
 function undoWaypoint() {
@@ -575,6 +747,80 @@ function pruneTrack(now = Date.now()) {
   if (next.length !== track.value.length) track.value = next;
 }
 
+function onMapPointerDown(event: MouseEvent | PointerEvent) {
+  mapPointerStart = { x: event.clientX, y: event.clientY };
+}
+
+function onMapPointerMove(event: MouseEvent | PointerEvent) {
+  if (!mapPointerStart) return;
+  if (Math.hypot(event.clientX - mapPointerStart.x, event.clientY - mapPointerStart.y) > 8) {
+    suppressNextMapClick = true;
+  }
+}
+
+function onMapPointerUp(event: MouseEvent | PointerEvent) {
+  if (planningEnabled.value && mapPointerStart) {
+    const moved = Math.hypot(event.clientX - mapPointerStart.x, event.clientY - mapPointerStart.y);
+    if (moved <= 8) {
+      const lnglat = getMapClickLngLat(event);
+      if (lnglat) addWaypoint(lnglat);
+    }
+  }
+  mapPointerStart = null;
+}
+
+function onMapPointerCancel() {
+  mapPointerStart = null;
+  suppressNextMapClick = false;
+}
+
+function onMapDragStart(event: DragEvent) {
+  event.preventDefault();
+}
+
+function onDocumentMapPointerDown(event: MouseEvent | PointerEvent) {
+  if (!isMapPointerEvent(event)) return;
+  onMapPointerDown(event);
+}
+
+function onDocumentMapPointerMove(event: MouseEvent | PointerEvent) {
+  if (!mapPointerStart) return;
+  onMapPointerMove(event);
+}
+
+function onDocumentMapPointerUp(event: MouseEvent | PointerEvent) {
+  if (!mapPointerStart) return;
+  onMapPointerUp(event);
+}
+
+function onDocumentMapPointerCancel() {
+  onMapPointerCancel();
+}
+
+function isMapPointerEvent(event: MouseEvent | PointerEvent) {
+  if (!mapContainer) return false;
+  const target = event.target;
+  if (target instanceof Node && mapContainer.contains(target)) return true;
+  const hit = document.elementFromPoint(event.clientX, event.clientY);
+  return !!hit && (hit === mapContainer || mapContainer.contains(hit));
+}
+
+function setupMapPointerBehavior() {
+  if (!mapContainer) return;
+
+  const disableImageDrag = () => {
+    mapContainer?.querySelectorAll('img').forEach((img) => {
+      img.draggable = false;
+    });
+  };
+
+  disableImageDrag();
+  mapImageObserver?.disconnect();
+  mapImageObserver = new MutationObserver(() => disableImageDrag());
+  mapImageObserver.observe(mapContainer, { childList: true, subtree: true });
+}
+
+
 </script>
 
 <template>
@@ -593,7 +839,12 @@ function pruneTrack(now = Date.now()) {
 
     <section class="layout">
       <div class="map-panel">
-        <div :ref="bindMap" class="amap"></div>
+        <div
+          :ref="bindMap"
+          class="amap"
+          :class="{ 'amap--display-scaled': mapDisplayScale > 1 }"
+          :style="{ '--map-display-scale': mapDisplayScale }"
+        ></div>
         <div
           v-if="shipOverlay.visible"
           class="ship-overlay"
@@ -612,7 +863,40 @@ function pruneTrack(now = Date.now()) {
           </button>
           <button :class="{ active: mapLayerMode === 'vector' }" @click="setMapLayer('vector')">矢量图</button>
           <button :class="{ active: mapLayerMode === 'satellite' }" @click="setMapLayer('satellite')">卫星图</button>
+          <div class="map-scale-control" aria-label="显示放大">
+            <button
+              v-for="scale in mapDisplayScales"
+              :key="scale"
+              :class="{ active: mapDisplayScale === scale }"
+              @click="setMapDisplayScale(scale)"
+            >
+              {{ scale }}x
+            </button>
+          </div>
           <span class="map-badge">{{ coordinateModeLabel }}</span>
+        </div>
+        <div class="map-joystick">
+          <div class="map-joystick__title">手动摇杆</div>
+          <div
+            class="joystick joystick--compact"
+            :class="{ active: joystick.active }"
+            @pointerdown="onJoystickPointerDown"
+            @pointermove="onJoystickPointerMove"
+            @pointerup="onJoystickPointerUp"
+            @pointercancel="onJoystickPointerUp"
+            @contextmenu.prevent
+          >
+            <div class="joystick-axis horizontal"></div>
+            <div class="joystick-axis vertical"></div>
+            <div
+              class="joystick-knob"
+              :style="{ transform: `translate(calc(-50% + ${joystick.knobX}px), calc(-50% + ${joystick.knobY}px))` }"
+            ></div>
+          </div>
+          <div class="joystick-readout joystick-readout--compact">
+            <span>油门 {{ throttle.toFixed(2) }}</span>
+            <span>转向 {{ steering.toFixed(2) }}</span>
+          </div>
         </div>
       </div>
 
@@ -730,29 +1014,6 @@ function pruneTrack(now = Date.now()) {
             <button @click="command('control.arm')">解锁</button>
             <button @click="command('control.disarm')">上锁</button>
             <button class="danger" @click="command('control.emergencyStop')">急停</button>
-          </div>
-
-          <div class="joystick-panel">
-            <div
-              class="joystick"
-              :class="{ active: joystick.active }"
-              @pointerdown="onJoystickPointerDown"
-              @pointermove="onJoystickPointerMove"
-              @pointerup="onJoystickPointerUp"
-              @pointercancel="onJoystickPointerUp"
-              @contextmenu.prevent
-            >
-              <div class="joystick-axis horizontal"></div>
-              <div class="joystick-axis vertical"></div>
-              <div
-                class="joystick-knob"
-                :style="{ transform: `translate(calc(-50% + ${joystick.knobX}px), calc(-50% + ${joystick.knobY}px))` }"
-              ></div>
-            </div>
-            <div class="joystick-readout">
-              <span>油门 {{ throttle.toFixed(2) }}</span>
-              <span>转向 {{ steering.toFixed(2) }}</span>
-            </div>
           </div>
 
           <div class="sticks">

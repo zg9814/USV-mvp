@@ -37,7 +37,10 @@ button.danger:hover {
 }
 
 .shell {
-  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
   padding: 20px;
 }
 
@@ -85,22 +88,45 @@ h1 {
   display: grid;
   gap: 16px;
   grid-template-columns: minmax(0, 1fr) 380px;
+  min-height: 0;
 }
 
 .map-panel {
   background: #dbece8;
   border: 1px solid #c6d9d4;
   border-radius: 8px;
-  min-height: calc(100vh - 108px);
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
   position: relative;
 }
 
 .amap {
+  cursor: crosshair !important;
   display: block;
   height: 100%;
-  min-height: calc(100vh - 108px);
+  min-height: 0;
+  touch-action: none;
+  user-select: none;
   width: 100%;
+}
+
+.amap * {
+  cursor: crosshair !important;
+}
+
+.amap:active {
+  cursor: crosshair !important;
+}
+
+.amap img {
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+.amap--display-scaled .tdt-map-pane {
+  scale: var(--map-display-scale, 1);
+  transform-origin: 0 0;
 }
 
 .map-empty {
@@ -111,6 +137,7 @@ h1 {
   left: 18px;
   padding: 10px 12px;
   position: absolute;
+  pointer-events: none;
   top: 18px;
   z-index: 500;
 }
@@ -125,6 +152,7 @@ h1 {
   left: 18px;
   padding: 8px 10px;
   position: absolute;
+  pointer-events: none;
   z-index: 500;
 }
 
@@ -134,6 +162,7 @@ h1 {
   gap: 8px;
   left: 18px;
   position: absolute;
+  pointer-events: none;
   top: 64px;
   z-index: 500;
   max-width: min(520px, calc(100% - 36px));
@@ -142,11 +171,36 @@ h1 {
 .map-tools button {
   background: rgba(18, 63, 58, 0.92);
   min-height: 36px;
+  pointer-events: auto;
   padding: 0 12px;
 }
 
 .map-tools button.active {
   background: #2563eb;
+}
+
+.map-scale-control {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #d8e2de;
+  border-radius: 8px;
+  display: flex;
+  gap: 2px;
+  min-height: 36px;
+  padding: 3px;
+  pointer-events: auto;
+}
+
+.map-scale-control button {
+  background: transparent;
+  color: #40514d;
+  min-height: 28px;
+  padding: 0 9px;
+}
+
+.map-scale-control button.active {
+  background: #2563eb;
+  color: #ffffff;
 }
 
 .map-badge {
@@ -159,7 +213,32 @@ h1 {
   font-size: 13px;
   font-weight: 700;
   min-height: 36px;
+  pointer-events: auto;
   padding: 0 10px;
+}
+
+.map-joystick {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #d8e2de;
+  border-radius: 12px;
+  box-shadow: 0 12px 24px rgba(18, 63, 58, 0.16);
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  pointer-events: none;
+  position: absolute;
+  right: 18px;
+  top: 18px;
+  width: 188px;
+  z-index: 520;
+}
+
+.map-joystick__title {
+  color: #40514d;
+  font-size: 13px;
+  font-weight: 700;
+  justify-self: start;
 }
 
 .ship-overlay {
@@ -237,8 +316,12 @@ h1 {
 }
 
 .side {
+  align-content: start;
   display: grid;
-  gap: 12px;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 
 .panel {
@@ -483,6 +566,12 @@ button:disabled {
   width: min(62vw, 220px);
 }
 
+.joystick--compact {
+  max-width: 164px;
+  pointer-events: auto;
+  width: 164px;
+}
+
 .joystick.active {
   border-color: #0f766e;
   cursor: grabbing;
@@ -547,6 +636,15 @@ button:disabled {
   padding: 6px 8px;
 }
 
+.joystick-readout--compact {
+  gap: 6px;
+}
+
+.joystick-readout--compact span {
+  font-size: 12px;
+  padding: 5px 7px;
+}
+
 .bars {
   display: grid;
   gap: 10px;
@@ -567,6 +665,8 @@ progress {
 
 @media (max-width: 900px) {
   .shell {
+    height: auto;
+    overflow: visible;
     padding: 10px;
   }
 
@@ -582,6 +682,7 @@ progress {
 
   .map-panel,
   .amap {
+    height: auto;
     min-height: 46vh;
   }
 
@@ -591,6 +692,13 @@ progress {
     top: 58px;
   }
 
+  .map-joystick {
+    bottom: 56px;
+    right: 10px;
+    top: auto;
+    width: 152px;
+  }
+
   .map-tools button,
   .map-badge {
     min-height: 34px;
@@ -598,10 +706,6 @@ progress {
 
   .side {
     gap: 10px;
-  }
-
-  .controls {
-    order: -1;
   }
 
   .buttons {
@@ -619,9 +723,17 @@ progress {
     grid-template-columns: repeat(2, 1fr);
   }
 
+  .controls {
+    order: -1;
+  }
+
   .joystick {
     max-width: 240px;
     width: min(74vw, 240px);
+  }
+
+  .joystick--compact {
+    width: 132px;
   }
 
   .sticks {
@@ -649,8 +761,19 @@ progress {
     left: 10px;
   }
 
+  .map-joystick {
+    bottom: 70px;
+    padding: 10px;
+    width: 132px;
+  }
+
+  .map-joystick__title {
+    font-size: 12px;
+  }
+
   .metric strong,
   .readout b {
     overflow-wrap: anywhere;
   }
+
 }
