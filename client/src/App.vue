@@ -119,6 +119,9 @@ const mapLayerMode = ref<'vector' | 'satellite'>('vector');
 const mapDisplayScale = ref(1);
 const mapDisplayScales = [1, 1.5, 2];
 const missionLoopCount = ref(1);
+const missionActiveLoopCount = ref(1);
+const missionCurrentLoop = ref(1);
+const lastMissionSeq = ref<number | null>(null);
 const MISSION_LOOP_MIN = 1;
 const MISSION_LOOP_MAX = 10;
 const mission = reactive<MissionState>({
@@ -175,14 +178,10 @@ const displayLngLabel = computed(() => displayShipPoint.value ? displayShipPoint
 const displayLatLabel = computed(() => displayShipPoint.value ? displayShipPoint.value.lat.toFixed(7) : '--');
 const routeLengthMeters = computed(() => calculateRouteLength(waypoints.value));
 const routeLengthLabel = computed(() => formatDistance(routeLengthMeters.value));
-const expandedMissionWaypoints = computed(() => expandMissionWaypoints(waypoints.value, missionLoopCount.value));
+const missionUploadItemCount = computed(() => waypoints.value.length + (missionLoopCount.value > 1 && waypoints.value.length > 0 ? 1 : 0));
 const missionLoopProgressLabel = computed(() => {
   if (mission.status !== 'active' && mission.status !== 'paused') return '';
-  if (mission.totalWaypoints <= 0 || waypoints.value.length <= 0) return '';
-  const loopSize = waypoints.value.length;
-  const totalLoops = Math.max(1, Math.ceil(mission.totalWaypoints / loopSize));
-  const currentLoop = Math.min(totalLoops, Math.floor(Math.max(0, mission.currentWaypoint) / loopSize) + 1);
-  return `任务进行中 ${currentLoop}/${totalLoops}`;
+  return `任务进行中 ${missionCurrentLoop.value}/${missionActiveLoopCount.value}`;
 });
 const missionStatusLabel = computed(() => {
   const labels: Record<string, string> = { idle: '空闲', uploading: '上传中', active: '执行中', paused: '已暂停', completed: '已完成' };
@@ -280,13 +279,14 @@ function connectWs() {
       statusText.value = `已发送 ${message.data.action}`;
     }
     if (message.type === 'mission.current') {
-      mission.currentWaypoint = message.data.seq;
+      updateMissionCurrent(message.data.seq);
     }
     if (message.type === 'mission.reached') {
       statusText.value = `到达航点 ${message.data.seq + 1}`;
     }
     if (message.type === 'mission.uploaded') {
       mission.status = message.data.success ? 'active' : 'idle';
+      if (!message.data.success) resetMissionLoopProgress();
       statusText.value = message.data.success ? '航线上传成功' : '航线上传失败';
     }
     if (message.type === 'mission.paused') {
@@ -302,6 +302,7 @@ function connectWs() {
       mission.waypoints = [];
       mission.currentWaypoint = 0;
       mission.totalWaypoints = 0;
+      resetMissionLoopProgress();
       statusText.value = '航线已清除';
     }
   });
@@ -331,12 +332,16 @@ function command(type: string) {
 
 function uploadMission() {
   if (waypoints.value.length === 0) return;
-  const uploadWaypoints = expandedMissionWaypoints.value;
+  const loopCount = clamp(Math.round(missionLoopCount.value), MISSION_LOOP_MIN, MISSION_LOOP_MAX);
+  missionLoopCount.value = loopCount;
+  missionActiveLoopCount.value = loopCount;
+  missionCurrentLoop.value = 1;
+  lastMissionSeq.value = null;
   mission.status = 'uploading';
-  mission.waypoints = uploadWaypoints;
+  mission.waypoints = waypoints.value;
   mission.currentWaypoint = 0;
-  mission.totalWaypoints = uploadWaypoints.length;
-  send('mission.upload', { waypoints: uploadWaypoints });
+  mission.totalWaypoints = missionUploadItemCount.value;
+  send('mission.upload', { waypoints: waypoints.value, loopCount });
 }
 
 function pauseMission() {
@@ -349,6 +354,21 @@ function resumeMission() {
 
 function clearMission() {
   send('mission.clear');
+}
+
+function updateMissionCurrent(seq: number) {
+  if (!Number.isFinite(seq)) return;
+  if (lastMissionSeq.value != null && seq < lastMissionSeq.value && missionCurrentLoop.value < missionActiveLoopCount.value) {
+    missionCurrentLoop.value += 1;
+  }
+  lastMissionSeq.value = seq;
+  mission.currentWaypoint = seq;
+}
+
+function resetMissionLoopProgress() {
+  missionActiveLoopCount.value = 1;
+  missionCurrentLoop.value = 1;
+  lastMissionSeq.value = null;
 }
 
 function setMode(mode: string) {
@@ -757,17 +777,6 @@ function setMissionLoopCount(event: Event) {
   missionLoopCount.value = clamp(Number.isFinite(value) ? value : 1, MISSION_LOOP_MIN, MISSION_LOOP_MAX);
 }
 
-function expandMissionWaypoints(source: Waypoint[], loops: number) {
-  const count = clamp(Math.round(loops), MISSION_LOOP_MIN, MISSION_LOOP_MAX);
-  const expanded: Waypoint[] = [];
-  for (let loop = 0; loop < count; loop += 1) {
-    for (const point of source) {
-      expanded.push({ ...point, order: expanded.length + 1 });
-    }
-  }
-  return expanded;
-}
-
 function calculateRouteLength(points: Waypoint[]) {
   let total = 0;
   for (let index = 1; index < points.length; index += 1) {
@@ -1035,7 +1044,7 @@ function setupMapPointerBehavior() {
           </div>
           <div class="route-summary">
             <div><span>航线长度</span><strong>{{ routeLengthLabel }}</strong></div>
-            <div><span>上传航点</span><strong>{{ expandedMissionWaypoints.length }} 点</strong></div>
+            <div><span>上传任务项</span><strong>{{ missionUploadItemCount }} 项</strong></div>
             <label>
               <span>循环次数</span>
               <input
@@ -1060,7 +1069,7 @@ function setupMapPointerBehavior() {
               <span>任务状态：</span>
               <strong>{{ missionStatusLabel }}</strong>
               <span v-if="mission.status === 'active' || mission.status === 'paused'">
-                (航点 {{ mission.currentWaypoint + 1 }}/{{ mission.totalWaypoints }})
+                (任务项 {{ mission.currentWaypoint + 1 }}/{{ mission.totalWaypoints }})
               </span>
               <em v-if="missionLoopProgressLabel">{{ missionLoopProgressLabel }}</em>
             </div>

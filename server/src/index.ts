@@ -11,6 +11,7 @@ import {
   buildSetMode,
   buildMissionCount,
   buildMissionItemInt,
+  buildMissionDoJumpInt,
   buildMissionClearAll,
   buildMissionSetCurrent,
   decodeFrames,
@@ -29,7 +30,7 @@ import {
   parseMissionItemReached
 } from './mavlink.js';
 import { UsvStore } from './state.js';
-import type { ManualControlInput, UsvState, Waypoint } from './types.js';
+import type { ManualControlInput, UsvState, Waypoint, MissionItem } from './types.js';
 
 const HTTP_PORT = Number(process.env.HTTP_PORT ?? 4000);
 const UDP_PORT = Number(process.env.UDP_PORT ?? 14550);
@@ -43,7 +44,7 @@ const clients = new Set<WebSocket>();
 let lastManualInputAt = 0;
 let lastSentZeroAt = 0;
 let missionUploadInProgress = false;
-let pendingWaypoints: Waypoint[] = [];
+let pendingMissionItems: MissionItem[] = [];
 
 udp.on('message', (packet, remote) => {
   const frames = decodeFrames(packet);
@@ -158,11 +159,15 @@ udp.bind(UDP_PORT, '0.0.0.0');
 // ==================== 航线处理函数 ====================
 
 function handleMissionRequest(targetSystem: number, targetComponent: number, sequence: number): void {
-  if (sequence < pendingWaypoints.length) {
-    const wp = pendingWaypoints[sequence];
-    const frame = buildMissionItemInt(targetSystem, targetComponent, sequence, wp.lat, wp.lng);
+  if (sequence < pendingMissionItems.length) {
+    const item = pendingMissionItems[sequence];
+    const frame = item.type === 'doJump'
+      ? buildMissionDoJumpInt(targetSystem, targetComponent, sequence, item.target, item.repeat)
+      : buildMissionItemInt(targetSystem, targetComponent, sequence, item.lat, item.lng);
     udp.send(frame, store.getState().remote!.port, store.getState().remote!.address);
-    console.log(`Sent waypoint ${sequence}: ${wp.lat}, ${wp.lng}`);
+    console.log(item.type === 'doJump'
+      ? `Sent DO_JUMP ${sequence}: target=${item.target} repeat=${item.repeat}`
+      : `Sent waypoint ${sequence}: ${item.lat}, ${item.lng}`);
   }
 }
 
@@ -171,7 +176,7 @@ function handleMissionAck(type: number, result: number): void {
 
   if (type === 0 && result === 0) { // MAV_MISSION_ACCEPTED
     missionUploadInProgress = false;
-    store.setMissionWaypoints(pendingWaypoints);
+    store.setMissionWaypoints(pendingMissionItems);
     store.setMissionStatus('active');
     const state = store.getState();
     if (state.remote) {
@@ -180,7 +185,7 @@ function handleMissionAck(type: number, result: number): void {
         udp.send(frame, state.remote.port, state.remote.address);
       }
     }
-    pendingWaypoints = [];
+    pendingMissionItems = [];
     broadcast('mission.uploaded', { success: true });
     console.log('Mission uploaded successfully');
   } else {
@@ -190,21 +195,42 @@ function handleMissionAck(type: number, result: number): void {
   }
 }
 
-function uploadMission(waypoints: Waypoint[]): { ok: boolean; message: string } {
+function uploadMission(waypoints: Waypoint[], loopCount = 1): { ok: boolean; message: string } {
   const state = store.getState();
   if (!state.online || !state.remote) return { ok: false, message: 'USV offline' };
   if (waypoints.length === 0) return { ok: false, message: 'No waypoints' };
 
+  const missionItems = buildMissionItems(waypoints, loopCount);
   const remote = state.remote;
   missionUploadInProgress = true;
-  pendingWaypoints = waypoints;
+  pendingMissionItems = missionItems;
   store.setMissionStatus('uploading');
 
-  const countFrame = buildMissionCount(state.systemId, state.componentId || 1, waypoints.length);
+  const countFrame = buildMissionCount(state.systemId, state.componentId || 1, missionItems.length);
   udp.send(countFrame, remote.port, remote.address);
-  console.log(`Uploading mission with ${waypoints.length} waypoints`);
+  console.log(`Uploading mission with ${missionItems.length} items (${waypoints.length} waypoints, loop=${loopCount})`);
 
   return { ok: true, message: 'Mission upload started' };
+}
+
+function buildMissionItems(waypoints: Waypoint[], loopCount: number): MissionItem[] {
+  const sanitizedLoopCount = Math.max(1, Math.min(10, Math.round(loopCount || 1)));
+  const items: MissionItem[] = waypoints.map((point, index) => ({
+    ...point,
+    order: index + 1,
+    type: 'waypoint'
+  }));
+
+  if (sanitizedLoopCount > 1 && waypoints.length > 0) {
+    items.push({
+      type: 'doJump',
+      order: items.length + 1,
+      target: 0,
+      repeat: sanitizedLoopCount - 1
+    });
+  }
+
+  return items;
 }
 
 function pauseMission(): { ok: boolean; message: string } {
@@ -256,8 +282,8 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/api/mission/upload' && req.method === 'POST') {
-    const body = await readBody(req) as { waypoints?: Waypoint[] };
-    const result = uploadMission(body.waypoints || []);
+    const body = await readBody(req) as { waypoints?: Waypoint[]; loopCount?: number };
+    const result = uploadMission(body.waypoints || [], body.loopCount);
     return sendJson(res, result.ok ? 200 : 400, result);
   }
 
@@ -314,8 +340,8 @@ wss.on('connection', (ws) => {
       }
       // 航线控制
       if (message.type === 'mission.upload') {
-        const data = message.data as { waypoints?: Waypoint[] };
-        const result = uploadMission(data.waypoints || []);
+        const data = message.data as { waypoints?: Waypoint[]; loopCount?: number };
+        const result = uploadMission(data.waypoints || [], data.loopCount);
         sendWs(ws, 'mission.upload', result);
       }
       if (message.type === 'mission.pause') {

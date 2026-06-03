@@ -45,9 +45,18 @@ export type Waypoint = {
   order: number;
 };
 
+export type MissionItem =
+  | (Waypoint & { type?: 'waypoint' })
+  | {
+      type: 'doJump';
+      order: number;
+      target: number;
+      repeat: number;
+    };
+
 export type MissionState = {
   status: 'idle' | 'uploading' | 'active' | 'paused' | 'completed';
-  waypoints: Waypoint[];
+  waypoints: MissionItem[];
   currentWaypoint: number;
   totalWaypoints: number;
 };

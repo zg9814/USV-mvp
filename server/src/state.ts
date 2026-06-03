@@ -1,4 +1,4 @@
-import type { RemoteEndpoint, UsvState, MissionState, Waypoint } from './types.js';
+import type { RemoteEndpoint, UsvState, MissionState, MissionItem } from './types.js';
 
 export class UsvStore {
   private state: UsvState = {
@@ -84,7 +84,7 @@ export class UsvStore {
     return { ...this.mission };
   }
 
-  setMissionWaypoints(waypoints: Waypoint[]): void {
+  setMissionWaypoints(waypoints: MissionItem[]): void {
     this.mission = {
       status: 'idle',
       waypoints,

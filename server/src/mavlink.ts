@@ -530,6 +530,35 @@ export function buildMissionItemInt(
   return buildFrame(73, payload);
 }
 
+export function buildMissionDoJumpInt(
+  targetSystem: number,
+  targetComponent: number,
+  sequence: number,
+  targetSequence: number,
+  repeat: number
+): Buffer {
+  const MAV_FRAME_MISSION = 2;
+  const MAV_CMD_DO_JUMP = 177;
+  const MAV_MISSION_TYPE_MISSION = 0;
+  const payload = Buffer.alloc(38);
+  payload.writeFloatLE(targetSequence, 0); // param1: target waypoint seq
+  payload.writeFloatLE(repeat, 4);         // param2: repeat count, -1 = infinite
+  payload.writeFloatLE(0, 8);
+  payload.writeFloatLE(0, 12);
+  payload.writeInt32LE(0, 16);
+  payload.writeInt32LE(0, 20);
+  payload.writeFloatLE(0, 24);
+  payload.writeUInt16LE(sequence, 28);
+  payload.writeUInt16LE(MAV_CMD_DO_JUMP, 30);
+  payload.writeUInt8(targetSystem, 32);
+  payload.writeUInt8(targetComponent, 33);
+  payload.writeUInt8(MAV_FRAME_MISSION, 34);
+  payload.writeUInt8(0, 35);
+  payload.writeUInt8(1, 36);
+  payload.writeUInt8(MAV_MISSION_TYPE_MISSION, 37);
+  return buildFrame(73, payload);
+}
+
 export function buildMissionClearAll(targetSystem: number, targetComponent: number): Buffer {
   const payload = Buffer.alloc(3);
   payload.writeUInt8(targetSystem, 0);
