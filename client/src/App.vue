@@ -118,6 +118,9 @@ const planningEnabled = ref(false);
 const mapLayerMode = ref<'vector' | 'satellite'>('vector');
 const mapDisplayScale = ref(1);
 const mapDisplayScales = [1, 1.5, 2];
+const missionLoopCount = ref(1);
+const MISSION_LOOP_MIN = 1;
+const MISSION_LOOP_MAX = 10;
 const mission = reactive<MissionState>({
   status: 'idle',
   waypoints: [],
@@ -170,6 +173,17 @@ const gpsSignalLabel = computed(() => {
 const coordinateModeLabel = computed(() => 'GPS/WGS-84 (天地图)');
 const displayLngLabel = computed(() => displayShipPoint.value ? displayShipPoint.value.lng.toFixed(7) : '--');
 const displayLatLabel = computed(() => displayShipPoint.value ? displayShipPoint.value.lat.toFixed(7) : '--');
+const routeLengthMeters = computed(() => calculateRouteLength(waypoints.value));
+const routeLengthLabel = computed(() => formatDistance(routeLengthMeters.value));
+const expandedMissionWaypoints = computed(() => expandMissionWaypoints(waypoints.value, missionLoopCount.value));
+const missionLoopProgressLabel = computed(() => {
+  if (mission.status !== 'active' && mission.status !== 'paused') return '';
+  if (mission.totalWaypoints <= 0 || waypoints.value.length <= 0) return '';
+  const loopSize = waypoints.value.length;
+  const totalLoops = Math.max(1, Math.ceil(mission.totalWaypoints / loopSize));
+  const currentLoop = Math.min(totalLoops, Math.floor(Math.max(0, mission.currentWaypoint) / loopSize) + 1);
+  return `任务进行中 ${currentLoop}/${totalLoops}`;
+});
 const missionStatusLabel = computed(() => {
   const labels: Record<string, string> = { idle: '空闲', uploading: '上传中', active: '执行中', paused: '已暂停', completed: '已完成' };
   return labels[mission.status] || mission.status;
@@ -317,11 +331,12 @@ function command(type: string) {
 
 function uploadMission() {
   if (waypoints.value.length === 0) return;
+  const uploadWaypoints = expandedMissionWaypoints.value;
   mission.status = 'uploading';
-  mission.waypoints = [...waypoints.value];
+  mission.waypoints = uploadWaypoints;
   mission.currentWaypoint = 0;
-  mission.totalWaypoints = waypoints.value.length;
-  send('mission.upload', { waypoints: waypoints.value });
+  mission.totalWaypoints = uploadWaypoints.length;
+  send('mission.upload', { waypoints: uploadWaypoints });
 }
 
 function pauseMission() {
@@ -736,6 +751,57 @@ function clearWaypoints() {
   waypoints.value = [];
 }
 
+function setMissionLoopCount(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const value = Math.round(Number(input.value));
+  missionLoopCount.value = clamp(Number.isFinite(value) ? value : 1, MISSION_LOOP_MIN, MISSION_LOOP_MAX);
+}
+
+function expandMissionWaypoints(source: Waypoint[], loops: number) {
+  const count = clamp(Math.round(loops), MISSION_LOOP_MIN, MISSION_LOOP_MAX);
+  const expanded: Waypoint[] = [];
+  for (let loop = 0; loop < count; loop += 1) {
+    for (const point of source) {
+      expanded.push({ ...point, order: expanded.length + 1 });
+    }
+  }
+  return expanded;
+}
+
+function calculateRouteLength(points: Waypoint[]) {
+  let total = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    total += haversineMeters(points[index - 1], points[index]);
+  }
+  return total;
+}
+
+function haversineMeters(a: Pick<Waypoint, 'lat' | 'lng'>, b: Pick<Waypoint, 'lat' | 'lng'>) {
+  const earthRadiusMeters = 6371008.8;
+  const lat1 = toRadians(a.lat);
+  const lat2 = toRadians(b.lat);
+  const deltaLat = toRadians(b.lat - a.lat);
+  const deltaLng = toRadians(b.lng - a.lng);
+  const sinLat = Math.sin(deltaLat / 2);
+  const sinLng = Math.sin(deltaLng / 2);
+  const value = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLng * sinLng;
+  return 2 * earthRadiusMeters * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
+}
+
+function formatDistance(meters: number) {
+  if (!Number.isFinite(meters) || meters <= 0) return '0 m';
+  if (meters < 1000) return `${meters.toFixed(1)} m`;
+  return `${(meters / 1000).toFixed(2)} km`;
+}
+
+function toRadians(value: number) {
+  return (value * Math.PI) / 180;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
 function centerOnShip() {
   if (!map || state.lat == null || state.lng == null) return;
   const T = window.T;
@@ -967,6 +1033,20 @@ function setupMapPointerBehavior() {
             <button @click="undoWaypoint" :disabled="waypoints.length === 0">撤销</button>
             <button @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
           </div>
+          <div class="route-summary">
+            <div><span>航线长度</span><strong>{{ routeLengthLabel }}</strong></div>
+            <div><span>上传航点</span><strong>{{ expandedMissionWaypoints.length }} 点</strong></div>
+            <label>
+              <span>循环次数</span>
+              <input
+                type="number"
+                :min="MISSION_LOOP_MIN"
+                :max="MISSION_LOOP_MAX"
+                :value="missionLoopCount"
+                @input="setMissionLoopCount"
+              />
+            </label>
+          </div>
           <ol v-if="waypoints.length > 0" class="waypoint-list">
             <li v-for="point in waypoints" :key="point.order">
               <b>{{ point.order }}</b>
@@ -982,6 +1062,7 @@ function setupMapPointerBehavior() {
               <span v-if="mission.status === 'active' || mission.status === 'paused'">
                 (航点 {{ mission.currentWaypoint + 1 }}/{{ mission.totalWaypoints }})
               </span>
+              <em v-if="missionLoopProgressLabel">{{ missionLoopProgressLabel }}</em>
             </div>
             <div class="mission-buttons">
               <button v-if="mission.status === 'idle'" @click="uploadMission" :disabled="waypoints.length === 0">
