@@ -43,6 +43,10 @@ const HTTP_PORT = Number(process.env.HTTP_PORT ?? 4000);
 const UDP_PORT = Number(process.env.UDP_PORT ?? 14550);
 const OFFLINE_AFTER_MS = Number(process.env.OFFLINE_AFTER_MS ?? 5000);
 const CONTROL_TIMEOUT_MS = Number(process.env.CONTROL_TIMEOUT_MS ?? 500);
+const COMM_LOG_INTERVAL_MS = Number(process.env.COMM_LOG_INTERVAL_MS ?? 1000);
+const COMM_LOW_VOLTAGE = Number(process.env.COMM_LOW_VOLTAGE ?? 20);
+const COMM_VOLTAGE_DROP = Number(process.env.COMM_VOLTAGE_DROP ?? 2);
+const LOG_RAW_MAVLINK = process.env.LOG_RAW_MAVLINK === '1';
 
 const store = new UsvStore(OFFLINE_AFTER_MS);
 const udp = dgram.createSocket('udp4');
@@ -64,10 +68,31 @@ let missionReadbackNextSeq = 0;
 let missionReadbackItems = new Map<number, ParsedMissionItem>();
 let missionReadbackTimer: NodeJS.Timeout | null = null;
 const MISSION_READBACK_TIMEOUT_MS = 8_000;
+let lastCommLogAt = 0;
+let lastRemoteKey: string | null = null;
+let lastVoltageSample: { voltage: number; at: number } | null = null;
+let lastBatteryCurrent: number | null = null;
+let lastManualControlLogAt = 0;
 
 udp.on('message', (packet, remote) => {
+  if (LOG_RAW_MAVLINK || missionUploadInProgress || missionReadbackInProgress) {
+    console.log(`RX UDP raw bytes=${packet.length} from=${remote.address}:${remote.port} hex=${packet.toString('hex')}`);
+  }
   const frames = decodeFrames(packet);
+  const remoteKey = `${remote.address}:${remote.port}`;
+  const messageIds: number[] = [];
+  let packetVoltage: number | null = null;
+  let packetCurrent: number | null = null;
+  let packetBattery: number | null = null;
+  let packetHadTelemetry = false;
+
+  if (frames.length > 0 && remoteKey !== lastRemoteKey) {
+    console.log(`COMM LINK remote=${remoteKey} previous=${lastRemoteKey ?? 'none'} packets=${frames.length}`);
+    lastRemoteKey = remoteKey;
+  }
+
   for (const frame of frames) {
+    messageIds.push(frame.messageId);
     const state = store.markSeen(frame.systemId, frame.componentId, {
       address: remote.address,
       port: remote.port
@@ -78,37 +103,59 @@ udp.on('message', (packet, remote) => {
         const heartbeat = parseHeartbeat(frame.payload);
         if (heartbeat) {
           store.patch(heartbeat);
+          packetHadTelemetry = true;
         }
         break;
       }
       case 1: {
         const sys = parseSysStatus(frame.payload);
-        if (sys) store.patch(sys);
+        if (sys) {
+          store.patch(sys);
+          packetVoltage = sys.voltage;
+          packetBattery = sys.batteryPercent;
+          packetCurrent = readSysStatusCurrent(frame.payload);
+          lastBatteryCurrent = packetCurrent;
+          observeVoltage('SYS_STATUS', packetVoltage, packetCurrent, packetBattery, remoteKey);
+          packetHadTelemetry = true;
+        }
         break;
       }
       case 24: {
         const gps = parseGpsRawInt(frame.payload);
-        if (gps) store.patch(gps);
+        if (gps) {
+          store.patch(gps);
+          packetHadTelemetry = true;
+        }
         break;
       }
       case 25: {
         const gpsStatus = parseGpsStatus(frame.payload);
-        if (gpsStatus) store.patch(gpsStatus);
+        if (gpsStatus) {
+          store.patch(gpsStatus);
+          packetHadTelemetry = true;
+        }
         break;
       }
       case 33: {
         const position = parseGlobalPositionInt(frame.payload);
-        if (position) store.patch(position);
+        if (position) {
+          store.patch(position);
+          packetHadTelemetry = true;
+        }
         break;
       }
       case 74: {
         const hud = parseVfrHud(frame.payload);
-        if (hud) store.patch(hud);
+        if (hud) {
+          store.patch(hud);
+          packetHadTelemetry = true;
+        }
         break;
       }
       case 77: {
         const ack = parseCommandAck(frame.payload);
         if (ack) {
+          console.log(`COMM RX COMMAND_ACK remote=${remoteKey} sys=${frame.systemId} comp=${frame.componentId} command=${ack.command} result=${ack.resultName}`);
           broadcast('usv.statusText', {
             deviceId: state.deviceId,
             severity: ack.result === 0 ? 6 : 4,
@@ -119,12 +166,21 @@ udp.on('message', (packet, remote) => {
       }
       case 147: {
         const battery = parseBatteryStatus(frame.payload);
-        if (battery) store.patch(battery);
+        if (battery) {
+          store.patch(battery);
+          if (battery.voltage !== null) {
+            packetVoltage = battery.voltage;
+            packetBattery = battery.batteryPercent;
+            observeVoltage('BATTERY_STATUS', packetVoltage, null, packetBattery, remoteKey);
+          }
+          packetHadTelemetry = true;
+        }
         break;
       }
       case 253: {
         const status = parseStatusText(frame.payload);
         if (status?.text) {
+          console.log(`COMM RX STATUSTEXT remote=${remoteKey} severity=${status.severity} text=${JSON.stringify(status.text)}`);
           broadcast('usv.statusText', { deviceId: state.deviceId, ...status });
         }
         break;
@@ -191,6 +247,10 @@ udp.on('message', (packet, remote) => {
     }
   }
 
+  if (frames.length > 0 && packetHadTelemetry && Date.now() - lastCommLogAt >= COMM_LOG_INTERVAL_MS) {
+    logCommSummary(remoteKey, messageIds, packetVoltage, packetCurrent, packetBattery);
+  }
+
   if (frames.length > 0) broadcastState();
 });
 
@@ -200,6 +260,116 @@ udp.on('listening', () => {
 });
 
 udp.bind(UDP_PORT, '0.0.0.0');
+
+function readSysStatusCurrent(payload: Buffer): number | null {
+  if (payload.length < 18) return null;
+  const currentRaw = payload.readInt16LE(16);
+  return currentRaw === -1 ? null : currentRaw / 100;
+}
+
+function observeVoltage(source: string, voltage: number | null, current: number | null, battery: number | null, remote: string): void {
+  if (voltage === null || !Number.isFinite(voltage)) return;
+  const now = Date.now();
+  if (voltage <= COMM_LOW_VOLTAGE) {
+    console.warn(`COMM ALERT low_voltage source=${source} remote=${remote} voltage=${voltage.toFixed(3)} current=${formatNumber(current, 2)} battery=${formatPercent(battery)}`);
+  }
+  if (lastVoltageSample && now - lastVoltageSample.at <= 10_000) {
+    const drop = lastVoltageSample.voltage - voltage;
+    if (drop >= COMM_VOLTAGE_DROP) {
+      console.warn(`COMM ALERT voltage_drop source=${source} remote=${remote} from=${lastVoltageSample.voltage.toFixed(3)} to=${voltage.toFixed(3)} drop=${drop.toFixed(3)} current=${formatNumber(current, 2)} battery=${formatPercent(battery)}`);
+    }
+  }
+  lastVoltageSample = { voltage, at: now };
+}
+
+function logCommSummary(
+  remote: string,
+  messageIds: number[],
+  packetVoltage: number | null,
+  packetCurrent: number | null,
+  packetBattery: number | null
+): void {
+  lastCommLogAt = Date.now();
+  const state = store.getState();
+  const voltage = packetVoltage ?? state.voltage;
+  const current = packetCurrent ?? lastBatteryCurrent;
+  const battery = packetBattery ?? state.batteryPercent;
+  console.log([
+    'COMM RX telemetry',
+    `remote=${remote}`,
+    `msgs=${summarizeMessages(messageIds)}`,
+    `sys=${state.systemId}/${state.componentId}`,
+    `mode=${state.mode}`,
+    `armed=${state.armed}`,
+    `voltage=${formatNumber(voltage, 3)}V`,
+    `current=${formatNumber(current, 2)}A`,
+    `battery=${formatPercent(battery)}`,
+    `gps=${state.gpsFixLabel}`,
+    `sats=${formatValue(state.gpsSatellites)}`,
+    `hdop=${formatNumber(state.gpsHdop, 2)}`,
+    `lat=${formatNumber(state.lat, 7)}`,
+    `lng=${formatNumber(state.lng, 7)}`,
+    `speed=${formatNumber(state.speed, 2)}`,
+    `heading=${formatNumber(state.heading, 1)}`
+  ].join(' '));
+}
+
+function summarizeMessages(messageIds: number[]): string {
+  const counts = new Map<number, number>();
+  for (const id of messageIds) counts.set(id, (counts.get(id) ?? 0) + 1);
+  return [...counts.entries()].map(([id, count]) => `${messageName(id)}:${count}`).join(',');
+}
+
+function messageName(id: number): string {
+  const names: Record<number, string> = {
+    0: 'HEARTBEAT',
+    1: 'SYS_STATUS',
+    24: 'GPS_RAW_INT',
+    25: 'GPS_STATUS',
+    30: 'ATTITUDE',
+    33: 'GLOBAL_POSITION_INT',
+    40: 'MISSION_REQUEST',
+    42: 'MISSION_CURRENT',
+    44: 'MISSION_COUNT',
+    46: 'MISSION_ITEM_REACHED',
+    47: 'MISSION_ACK',
+    73: 'MISSION_ITEM_INT',
+    74: 'VFR_HUD',
+    77: 'COMMAND_ACK',
+    147: 'BATTERY_STATUS',
+    253: 'STATUSTEXT'
+  };
+  return names[id] ?? `MSG_${id}`;
+}
+
+function formatNumber(value: number | null | undefined, digits: number): string {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '--';
+}
+
+function formatPercent(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? `${value}%` : '--';
+}
+
+function formatValue(value: number | string | boolean | null | undefined): string {
+  return value === null || value === undefined ? '--' : String(value);
+}
+
+function logControlTx(action: string, details: Record<string, unknown> = {}, force = false): void {
+  if (!force && action === 'manual' && Date.now() - lastManualControlLogAt < COMM_LOG_INTERVAL_MS) return;
+  if (action === 'manual') lastManualControlLogAt = Date.now();
+  const state = store.getState();
+  const detailText = Object.entries(details).map(([key, value]) => `${key}=${value}`).join(' ');
+  console.log([
+    'COMM TX control',
+    `action=${action}`,
+    detailText,
+    `target=${state.systemId}/${state.componentId || 1}`,
+    `remote=${state.remote ? `${state.remote.address}:${state.remote.port}` : 'unknown'}`,
+    `mode=${state.mode}`,
+    `armed=${state.armed}`,
+    `voltage=${formatNumber(state.voltage, 3)}V`
+  ].filter(Boolean).join(' '));
+}
 
 // ==================== 航线处理函数 ====================
 
@@ -663,6 +833,7 @@ function sendSetMode(mode: unknown): { ok: boolean; message: string } {
   const state = store.getState();
   if (!state.online || !state.remote) return { ok: false, message: 'USV offline or remote endpoint unknown' };
 
+  logControlTx('setMode', { mode: modeKey }, true);
   for (const frame of buildSetMode(state.systemId, state.componentId || 1, modeKey as never, state.autopilot)) {
     udp.send(frame, state.remote.port, state.remote.address);
   }
@@ -679,6 +850,7 @@ function sendManualControl(input: ManualControlInput, markInput = true): { ok: b
     buildManualControl(state.systemId, input),
     buildRcChannelsOverride(state.systemId, state.componentId || 1, input)
   ];
+  logControlTx('manual', { throttle: input.throttle.toFixed(2), steering: input.steering.toFixed(2), markInput }, !markInput);
   for (const frame of frames) udp.send(frame, state.remote.port, state.remote.address);
   broadcast('control.sent', { action: 'manual', input });
   return { ok: true, message: 'manual control sent' };
@@ -696,6 +868,7 @@ function sendArm(arm: boolean): { ok: boolean; message: string } {
   }
 
   const frame = buildArmDisarm(state.systemId, state.componentId || 1, arm);
+  logControlTx(arm ? 'arm' : 'disarm', {}, true);
   udp.send(frame, state.remote.port, state.remote.address);
 
   for (const neutralFrame of [
@@ -713,6 +886,7 @@ function sendEmergencyStop(): { ok: boolean; message: string } {
   const state = store.getState();
   if (!state.online || !state.remote) return { ok: false, message: 'USV offline or remote endpoint unknown' };
 
+  logControlTx('emergencyStop', {}, true);
   for (const frame of buildEmergencyStop(state.systemId, state.componentId || 1)) {
     udp.send(frame, state.remote.port, state.remote.address);
   }

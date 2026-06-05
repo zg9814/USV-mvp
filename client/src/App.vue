@@ -145,7 +145,6 @@ let controlTimer: number | null = null;
 let reconnectTimer: number | null = null;
 let mapContainer: HTMLDivElement | null = null;
 let map: any = null;
-let shipMarker: any = null;
 let trackLine: any = null;
 let routeLine: any = null;
 let waypointMarkers: any[] = [];
@@ -215,6 +214,7 @@ onMounted(() => {
   controlTimer = window.setInterval(() => {
     pruneTrack();
     updateKeyboardControl();
+    updateShipOverlayPosition();
     if (Math.abs(throttle.value) > 0 || Math.abs(steering.value) > 0) {
       sendManual();
     }
@@ -629,6 +629,7 @@ async function initializeMapOnce() {
   });
   map.addOverLay(routeLine);
 
+  bindMapMoveEvents();
   setupMapPointerBehavior();
   showDebugShipMarker();
   updateMapOverlays();
@@ -664,22 +665,7 @@ function updateMapOverlays() {
   const T = window.T;
   const position = new T.LngLat(state.lng, state.lat);
   displayShipPoint.value = { lng: state.lng, lat: state.lat };
-
-  if (!shipMarker) {
-    const icon = new T.Icon({
-      iconUrl: 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%230f766e"><circle cx="12" cy="12" r="10"/><polygon points="12,2 18,18 12,14 6,18" fill="white"/></svg>'),
-      iconSize: new T.Point(38, 38),
-      iconAnchor: new T.Point(19, 19)
-    });
-    shipMarker = new T.Marker(position, { icon });
-    map.addOverLay(shipMarker);
-  } else {
-    shipMarker.setLngLat(position);
-  }
-
-  shipOverlay.visible = false;
-  shipOverlay.heading = state.heading ?? 0;
-  shipOverlay.online = state.online;
+  updateShipOverlayPosition();
 
   displayTrack.value = track.value.map((p) => ({ lng: p.lng, lat: p.lat }));
   trackLine?.setLngLats(displayTrack.value.map((p) => new T.LngLat(p.lng, p.lat)));
@@ -687,7 +673,83 @@ function updateMapOverlays() {
   if (!hasCenteredMap) {
     map.centerAndZoom(position, 17);
     hasCenteredMap = true;
+    updateShipOverlayPosition();
   }
+}
+
+function updateShipOverlayPosition() {
+  if (!map || !mapContainer || !displayShipPoint.value) {
+    shipOverlay.visible = false;
+    return;
+  }
+
+  const point = lngLatToContainerPoint(displayShipPoint.value.lng, displayShipPoint.value.lat);
+  if (!point) {
+    shipOverlay.visible = false;
+    return;
+  }
+
+  const mapRect = mapContainer.getBoundingClientRect();
+  const panelRect = mapContainer.parentElement?.getBoundingClientRect() ?? mapRect;
+  shipOverlay.left = point.x + mapRect.left - panelRect.left;
+  shipOverlay.top = point.y + mapRect.top - panelRect.top;
+  shipOverlay.heading = normalizeHeading(state.heading);
+  shipOverlay.online = state.online;
+  shipOverlay.visible = true;
+}
+
+function lngLatToContainerPoint(lng: number, lat: number) {
+  if (!map || !mapContainer) return null;
+
+  const T = window.T;
+  const lngLat = new T.LngLat(lng, lat);
+  const apiPoint = map.lngLatToContainerPoint?.(lngLat)
+    || map.lngLatToLayerPoint?.(lngLat)
+    || map.lngLatToPixel?.(lngLat);
+  const normalizedApiPoint = normalizeMapPoint(apiPoint);
+  if (normalizedApiPoint) {
+    return {
+      x: normalizedApiPoint.x * mapDisplayScale.value,
+      y: normalizedApiPoint.y * mapDisplayScale.value
+    };
+  }
+
+  return lngLatToContainerPointByMercator(lng, lat);
+}
+
+function normalizeMapPoint(point: any) {
+  if (!point) return null;
+  const x = typeof point.x === 'number' ? point.x : typeof point.getX === 'function' ? point.getX() : Array.isArray(point) ? point[0] : null;
+  const y = typeof point.y === 'number' ? point.y : typeof point.getY === 'function' ? point.getY() : Array.isArray(point) ? point[1] : null;
+  if (typeof x !== 'number' || typeof y !== 'number') return null;
+  return { x, y };
+}
+
+function lngLatToContainerPointByMercator(lng: number, lat: number) {
+  if (!map || !mapContainer) return null;
+
+  const center = map.getCenter?.();
+  const zoom = map.getZoom?.();
+  if (!center || typeof zoom !== 'number') return null;
+
+  const centerLng = center.lng ?? center.getLng?.();
+  const centerLat = center.lat ?? center.getLat?.();
+  if (typeof centerLng !== 'number' || typeof centerLat !== 'number') return null;
+
+  const mapRect = mapContainer.getBoundingClientRect();
+  const scale = 256 * 2 ** zoom;
+  const centerWorld = lngLatToWorldPixel(centerLng, centerLat, scale);
+  const pointWorld = lngLatToWorldPixel(lng, lat, scale);
+
+  return {
+    x: (mapRect.width / 2 + pointWorld.x - centerWorld.x) * mapDisplayScale.value,
+    y: (mapRect.height / 2 + pointWorld.y - centerWorld.y) * mapDisplayScale.value
+  };
+}
+
+function normalizeHeading(heading: number | null) {
+  if (heading == null || !Number.isFinite(heading)) return 0;
+  return ((heading % 360) + 360) % 360;
 }
 
 function showDebugShipMarker() {
@@ -888,6 +950,7 @@ function onMapPointerMove(event: MouseEvent | PointerEvent) {
   if (Math.hypot(event.clientX - mapPointerStart.x, event.clientY - mapPointerStart.y) > 8) {
     suppressNextMapClick = true;
   }
+  updateShipOverlayPosition();
 }
 
 function onMapPointerUp(event: MouseEvent | PointerEvent) {
@@ -899,6 +962,7 @@ function onMapPointerUp(event: MouseEvent | PointerEvent) {
     }
   }
   mapPointerStart = null;
+  updateShipOverlayPosition();
 }
 
 function onMapPointerCancel() {
@@ -950,6 +1014,16 @@ function setupMapPointerBehavior() {
   mapImageObserver?.disconnect();
   mapImageObserver = new MutationObserver(() => disableImageDrag());
   mapImageObserver.observe(mapContainer, { childList: true, subtree: true });
+}
+
+function bindMapMoveEvents() {
+  const refresh = () => updateShipOverlayPosition();
+  map?.addEventListener?.('move', refresh);
+  map?.addEventListener?.('moveend', refresh);
+  map?.addEventListener?.('zoom', refresh);
+  map?.addEventListener?.('zoomend', refresh);
+  map?.addEventListener?.('drag', refresh);
+  map?.addEventListener?.('dragend', refresh);
 }
 
 
