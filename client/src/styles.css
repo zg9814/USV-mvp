@@ -28,11 +28,16 @@ button:hover {
   background: #0f766e;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 button.danger {
   background: #b42318;
 }
 
-button.danger:hover {
+button.danger:hover:not(:disabled) {
   background: #d92d20;
 }
 
@@ -84,11 +89,203 @@ h1 {
   color: #05603a;
 }
 
+.view-tab {
+  background: #e2e8e5;
+  color: #40514d;
+  min-height: 36px;
+  padding: 0 12px;
+}
+
+.view-tab:hover,
+.view-tab.active {
+  background: #123f3a;
+  color: #ffffff;
+}
+
 .layout {
   display: grid;
   gap: 16px;
   grid-template-columns: minmax(0, 1fr) 380px;
   min-height: 0;
+}
+
+.logs-page {
+  display: grid;
+  gap: 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.logs-toolbar {
+  align-items: end;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(5, minmax(120px, 1fr)) repeat(3, auto);
+}
+
+.logs-toolbar label {
+  display: grid;
+  gap: 5px;
+}
+
+.logs-toolbar span {
+  color: #657873;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.logs-toolbar input,
+.logs-toolbar select {
+  border: 1px solid #c6d9d4;
+  border-radius: 8px;
+  color: #17211f;
+  font: inherit;
+  height: 38px;
+  min-width: 0;
+  padding: 0 10px;
+  width: 100%;
+}
+
+.logs-toolbar button {
+  min-height: 38px;
+  white-space: nowrap;
+}
+
+.logs-error {
+  background: #fee4e2;
+  border: 1px solid #fecdca;
+  border-radius: 8px;
+  color: #b42318;
+  margin: 0;
+  padding: 10px 12px;
+}
+
+.logs-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-rows: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.log-panel {
+  display: grid;
+  gap: 10px;
+  min-height: 0;
+}
+
+.log-panel__title {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.log-panel__title span {
+  color: #657873;
+  font-size: 13px;
+}
+
+.table-wrap {
+  border: 1px solid #d8e2de;
+  border-radius: 8px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.log-table {
+  border-collapse: collapse;
+  font-size: 13px;
+  min-width: 1080px;
+  width: 100%;
+}
+
+.log-table th,
+.log-table td {
+  border-bottom: 1px solid #e8efec;
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.log-table th {
+  background: #f6faf8;
+  color: #40514d;
+  font-size: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.clickable-row {
+  cursor: pointer;
+}
+
+.clickable-row:hover {
+  background: #f6faf8;
+}
+
+.message-cell {
+  max-width: 360px;
+  overflow-wrap: anywhere;
+}
+
+.level-chip {
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 8px;
+}
+
+.level-chip.debug {
+  background: #edf5f2;
+  color: #40514d;
+}
+
+.level-chip.info {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.level-chip.warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.level-chip.error {
+  background: #fee4e2;
+  color: #b42318;
+}
+
+.detail-row td {
+  background: #fbfdfc;
+}
+
+.detail-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.detail-grid div {
+  background: #eef4f2;
+  border-radius: 8px;
+  display: flex;
+  gap: 8px;
+  padding: 6px 8px;
+}
+
+.detail-row pre {
+  background: #17211f;
+  border-radius: 8px;
+  color: #e8efec;
+  margin: 6px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .map-panel {
@@ -727,6 +924,22 @@ progress {
 
   .layout {
     grid-template-columns: 1fr;
+  }
+
+  .logs-page {
+    overflow: visible;
+  }
+
+  .logs-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .logs-toolbar button {
+    width: 100%;
+  }
+
+  .logs-grid {
+    overflow: visible;
   }
 
   .map-panel,

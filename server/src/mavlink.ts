@@ -178,6 +178,10 @@ export function buildArmDisarm(targetSystem: number, targetComponent: number, ar
   return buildCommandLong(targetSystem, targetComponent, 400, [arm ? 1 : 0, 0, 0, 0, 0, 0, 0]);
 }
 
+export function buildRebootAutopilot(targetSystem: number, targetComponent: number): Buffer {
+  return buildCommandLong(targetSystem, targetComponent, 246, [1, 0, 0, 0, 0, 0, 0]);
+}
+
 export function buildEmergencyStop(targetSystem: number, targetComponent: number): Buffer[] {
   return [
     buildManualControl(targetSystem, { throttle: 0, steering: 0 }),

@@ -57,6 +57,38 @@ type MissionState = {
   totalWaypoints: number;
 };
 
+type EventLogRow = {
+  id: number;
+  occurred_at: string;
+  level: string;
+  category: string;
+  type: string;
+  mode: string | null;
+  armed: number | null;
+  command: number | null;
+  result: string | null;
+  message: string;
+  details_json: string | null;
+  raw_hex: string | null;
+};
+
+type TelemetrySampleRow = {
+  id: number;
+  occurred_at: string;
+  mode: string | null;
+  armed: number | null;
+  voltage: number | null;
+  current: number | null;
+  battery_percent: number | null;
+  gps_fix_label: string | null;
+  gps_satellites: number | null;
+  gps_hdop: number | null;
+  lat: number | null;
+  lng: number | null;
+  speed: number | null;
+  heading: number | null;
+};
+
 declare global {
   interface Window {
     T?: any;
@@ -139,6 +171,19 @@ const shipOverlay = reactive({
 });
 const displayShipPoint = ref<MapPoint | null>(null);
 const displayTrack = ref<MapPoint[]>([]);
+const activeView = ref<'console' | 'logs'>('console');
+const logFilters = reactive({
+  from: toLocalDateInput(new Date(Date.now() - 60 * 60 * 1000)),
+  to: toLocalDateInput(new Date()),
+  level: '',
+  category: '',
+  type: ''
+});
+const eventRows = ref<EventLogRow[]>([]);
+const telemetryRows = ref<TelemetrySampleRow[]>([]);
+const expandedEventId = ref<number | null>(null);
+const logsLoading = ref(false);
+const logsError = ref('');
 
 let ws: WebSocket | null = null;
 let controlTimer: number | null = null;
@@ -275,7 +320,16 @@ function connectWs() {
       statusText.value = message.data.text;
     }
     if (message.type === 'control.sent') {
-      statusText.value = `已发送 ${message.data.action}`;
+      if (message.data.action === 'rebootAutopilot') {
+        statusText.value = '重启命令已发送，等待心跳恢复';
+      } else if (message.data.action === 'rebootDisarmPending') {
+        statusText.value = '已发送上锁命令，确认上锁后将重启飞控';
+      } else {
+        statusText.value = `已发送 ${message.data.action}`;
+      }
+    }
+    if (message.type === 'error') {
+      statusText.value = message.data.message || '控制命令发送失败';
     }
     if (message.type === 'mission.current') {
       updateMissionCurrent(message.data.seq);
@@ -337,6 +391,96 @@ async function postJson<T = { ok: boolean; message?: string }>(url: string, data
   return result;
 }
 
+async function loadLogs() {
+  logsLoading.value = true;
+  logsError.value = '';
+  try {
+    const [eventsResponse, telemetryResponse] = await Promise.all([
+      fetch(`/api/logs/events?${logQueryParams()}`),
+      fetch(`/api/logs/telemetry?${telemetryQueryParams()}`)
+    ]);
+    const events = await eventsResponse.json() as { data?: { items?: EventLogRow[] } };
+    const telemetry = await telemetryResponse.json() as { data?: { items?: TelemetrySampleRow[] } };
+    eventRows.value = events.data?.items ?? [];
+    telemetryRows.value = telemetry.data?.items ?? [];
+  } catch (error) {
+    logsError.value = error instanceof Error ? error.message : 'Failed to load logs';
+  } finally {
+    logsLoading.value = false;
+  }
+}
+
+function logQueryParams() {
+  const params = new URLSearchParams();
+  params.set('from', localInputToIso(logFilters.from));
+  params.set('to', localInputToIso(logFilters.to));
+  params.set('limit', '200');
+  if (logFilters.level) params.set('level', logFilters.level);
+  if (logFilters.category) params.set('category', logFilters.category);
+  if (logFilters.type) params.set('type', logFilters.type);
+  return params.toString();
+}
+
+function telemetryQueryParams() {
+  const params = new URLSearchParams();
+  params.set('from', localInputToIso(logFilters.from));
+  params.set('to', localInputToIso(logFilters.to));
+  params.set('limit', '200');
+  return params.toString();
+}
+
+function exportLogs(kind: 'events' | 'telemetry') {
+  const query = kind === 'events' ? logQueryParams() : telemetryQueryParams();
+  window.location.href = `/api/logs/export.csv?kind=${kind}&${query}`;
+}
+
+function switchView(view: 'console' | 'logs') {
+  activeView.value = view;
+  if (view === 'logs' && eventRows.value.length === 0 && telemetryRows.value.length === 0) {
+    loadLogs();
+  }
+}
+
+function eventDetails(row: EventLogRow) {
+  if (!row.details_json) return null;
+  try {
+    return JSON.parse(row.details_json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function eventVoltage(row: EventLogRow) {
+  const details = eventDetails(row);
+  const value = details?.voltage;
+  return typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(2)} V` : '--';
+}
+
+function eventGps(row: EventLogRow) {
+  const details = eventDetails(row);
+  const fix = typeof details?.gpsFixLabel === 'string' ? details.gpsFixLabel : '--';
+  const sats = typeof details?.gpsSatellites === 'number' ? details.gpsSatellites : '--';
+  return `${fix} / ${sats}`;
+}
+
+function formatLogTime(value: string | null) {
+  return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '--';
+}
+
+function formatNullable(value: unknown, digits = 2) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '--';
+}
+
+function toLocalDateInput(date: Date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function localInputToIso(value: string) {
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? new Date(time).toISOString() : new Date().toISOString();
+}
+
 function sendManual() {
   send('manual.control', {
     throttle: Number(throttle.value.toFixed(2)),
@@ -346,6 +490,16 @@ function sendManual() {
 
 function command(type: string) {
   send(type);
+}
+
+function rebootAutopilot() {
+  const message = state.armed
+    ? '当前已解锁，系统会先发送上锁命令，确认上锁后再重启飞控。重启期间 MAVLink 会短暂断开。确认继续？'
+    : '重启飞控会导致 MAVLink 短暂断开，数秒后等待心跳恢复。确认重启？';
+  if (!window.confirm(message)) return;
+  if (send('control.reboot', { confirmed: true })) {
+    statusText.value = state.armed ? '已发送上锁命令，确认上锁后将重启飞控' : '重启命令已发送，等待心跳恢复';
+  }
 }
 
 async function uploadMission() {
@@ -1037,13 +1191,15 @@ function bindMapMoveEvents() {
         <h1>{{ state.deviceId }}</h1>
       </div>
       <div class="status-pills">
+        <button class="view-tab" :class="{ active: activeView === 'console' }" @click="switchView('console')">控制台</button>
+        <button class="view-tab" :class="{ active: activeView === 'logs' }" @click="switchView('logs')">事件日志</button>
         <span class="pill" :class="{ ok: wsConnected }">WS {{ wsConnected ? '连接' : '断开' }}</span>
         <span class="pill" :class="{ ok: state.online }">船端 {{ state.online ? '在线' : '离线' }}</span>
         <span class="pill" :class="{ ok: state.remoteKnown }">UDP {{ state.udpPort }}</span>
       </div>
     </section>
 
-    <section class="layout">
+    <section v-if="activeView === 'console'" class="layout">
       <div class="map-panel">
         <div
           :ref="bindMap"
@@ -1238,6 +1394,7 @@ function bindMapMoveEvents() {
             <button @click="command('control.arm')">解锁</button>
             <button @click="command('control.disarm')">上锁</button>
             <button class="danger" @click="command('control.emergencyStop')">急停</button>
+            <button class="danger" :disabled="!state.online" @click="rebootAutopilot">重启飞控</button>
           </div>
 
           <div class="sticks">
@@ -1259,6 +1416,145 @@ function bindMapMoveEvents() {
           </div>
         </div>
       </aside>
+    </section>
+
+    <section v-else class="logs-page">
+      <div class="logs-toolbar panel">
+        <label>
+          <span>开始</span>
+          <input v-model="logFilters.from" type="datetime-local" />
+        </label>
+        <label>
+          <span>结束</span>
+          <input v-model="logFilters.to" type="datetime-local" />
+        </label>
+        <label>
+          <span>级别</span>
+          <select v-model="logFilters.level">
+            <option value="">全部</option>
+            <option value="debug">debug</option>
+            <option value="info">info</option>
+            <option value="warn">warn</option>
+            <option value="error">error</option>
+          </select>
+        </label>
+        <label>
+          <span>类别</span>
+          <select v-model="logFilters.category">
+            <option value="">全部</option>
+            <option value="control">control</option>
+            <option value="ack">ack</option>
+            <option value="statustext">statustext</option>
+            <option value="mission">mission</option>
+            <option value="link">link</option>
+            <option value="power">power</option>
+            <option value="service">service</option>
+          </select>
+        </label>
+        <label>
+          <span>类型</span>
+          <input v-model.trim="logFilters.type" placeholder="control_tx" />
+        </label>
+        <button @click="loadLogs" :disabled="logsLoading">{{ logsLoading ? '加载中' : '刷新' }}</button>
+        <button @click="exportLogs('events')">导出事件</button>
+        <button @click="exportLogs('telemetry')">导出遥测</button>
+      </div>
+
+      <p v-if="logsError" class="logs-error">{{ logsError }}</p>
+
+      <div class="logs-grid">
+        <div class="panel log-panel">
+          <div class="log-panel__title">
+            <strong>事件日志</strong>
+            <span>{{ eventRows.length }} 条</span>
+          </div>
+          <div class="table-wrap">
+            <table class="log-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>级别</th>
+                  <th>类别</th>
+                  <th>类型</th>
+                  <th>消息</th>
+                  <th>模式</th>
+                  <th>解锁</th>
+                  <th>GPS</th>
+                  <th>电压</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="row in eventRows" :key="row.id">
+                  <tr class="clickable-row" @click="expandedEventId = expandedEventId === row.id ? null : row.id">
+                    <td>{{ formatLogTime(row.occurred_at) }}</td>
+                    <td><span class="level-chip" :class="row.level">{{ row.level }}</span></td>
+                    <td>{{ row.category }}</td>
+                    <td>{{ row.type }}</td>
+                    <td class="message-cell">{{ row.message }}</td>
+                    <td>{{ row.mode ?? '--' }}</td>
+                    <td>{{ row.armed === 1 ? 'ARMED' : row.armed === 0 ? 'SAFE' : '--' }}</td>
+                    <td>{{ eventGps(row) }}</td>
+                    <td>{{ eventVoltage(row) }}</td>
+                  </tr>
+                  <tr v-if="expandedEventId === row.id" class="detail-row">
+                    <td colspan="9">
+                      <div class="detail-grid">
+                        <div><b>command</b><span>{{ row.command ?? '--' }}</span></div>
+                        <div><b>result</b><span>{{ row.result ?? '--' }}</span></div>
+                      </div>
+                      <pre>{{ row.details_json || '{}' }}</pre>
+                      <pre v-if="row.raw_hex">raw_hex: {{ row.raw_hex }}</pre>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel log-panel">
+          <div class="log-panel__title">
+            <strong>遥测采样</strong>
+            <span>{{ telemetryRows.length }} 条</span>
+          </div>
+          <div class="table-wrap">
+            <table class="log-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>电压</th>
+                  <th>电流</th>
+                  <th>电量</th>
+                  <th>GPS</th>
+                  <th>卫星</th>
+                  <th>HDOP</th>
+                  <th>坐标</th>
+                  <th>速度</th>
+                  <th>航向</th>
+                  <th>模式</th>
+                  <th>解锁</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in telemetryRows" :key="row.id">
+                  <td>{{ formatLogTime(row.occurred_at) }}</td>
+                  <td>{{ formatNullable(row.voltage) }}</td>
+                  <td>{{ formatNullable(row.current) }}</td>
+                  <td>{{ row.battery_percent ?? '--' }}</td>
+                  <td>{{ row.gps_fix_label ?? '--' }}</td>
+                  <td>{{ row.gps_satellites ?? '--' }}</td>
+                  <td>{{ formatNullable(row.gps_hdop) }}</td>
+                  <td>{{ formatNullable(row.lng, 7) }}, {{ formatNullable(row.lat, 7) }}</td>
+                  <td>{{ formatNullable(row.speed) }}</td>
+                  <td>{{ formatNullable(row.heading, 1) }}</td>
+                  <td>{{ row.mode ?? '--' }}</td>
+                  <td>{{ row.armed === 1 ? 'ARMED' : row.armed === 0 ? 'SAFE' : '--' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 </template>
