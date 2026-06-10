@@ -56,6 +56,8 @@ const RETURN_HOME_LOW_VOLTAGE = Number(process.env.RETURN_HOME_LOW_VOLTAGE ?? 21
 const RETURN_HOME_LOW_VOLTAGE_SAMPLES = Number(process.env.RETURN_HOME_LOW_VOLTAGE_SAMPLES ?? 5);
 const RETURN_HOME_RESET_VOLTAGE = Number(process.env.RETURN_HOME_RESET_VOLTAGE ?? 22);
 const RETURN_HOME_ARRIVAL_RADIUS_M = Number(process.env.RETURN_HOME_ARRIVAL_RADIUS_M ?? 5);
+const WAYPOINT_WAIT_MIN_SECONDS = 0;
+const WAYPOINT_WAIT_MAX_SECONDS = 600;
 const LOG_RAW_MAVLINK = process.env.LOG_RAW_MAVLINK === '1';
 const EVENT_DB_PATH = process.env.EVENT_DB_PATH ?? 'data/usv-events.sqlite';
 const EVENT_LOG_RETENTION_DAYS = Number(process.env.EVENT_LOG_RETENTION_DAYS ?? 30);
@@ -751,13 +753,14 @@ function toRadians(value: number): number {
 function handleMissionRequest(targetSystem: number, targetComponent: number, sequence: number): void {
   if (sequence < pendingMissionItems.length) {
     const item = pendingMissionItems[sequence];
+    const waitSeconds = item.type === 'waypoint' ? sanitizeWaitSeconds(item.waitSeconds) : 0;
     const frame = item.type === 'doJump'
       ? buildMissionDoJumpInt(targetSystem, targetComponent, sequence, item.target, item.repeat)
-      : buildMissionItemInt(targetSystem, targetComponent, sequence, item.lat, item.lng, item.altitude ?? 0, 16, item.type === 'home' ? 0 : 6);
-    sendMissionFrame(frame, item.type === 'doJump' ? `MISSION_DO_JUMP_INT seq=${sequence}` : `MISSION_ITEM_INT seq=${sequence}`);
+      : buildMissionItemInt(targetSystem, targetComponent, sequence, item.lat, item.lng, item.altitude ?? 0, 16, item.type === 'home' ? 0 : 6, waitSeconds);
+    sendMissionFrame(frame, item.type === 'doJump' ? `MISSION_DO_JUMP_INT seq=${sequence}` : `MISSION_ITEM_INT seq=${sequence} hold=${waitSeconds}s`);
     console.log(item.type === 'doJump'
       ? `Sent DO_JUMP ${sequence}: target=${item.target} repeat=${item.repeat}`
-      : `Sent waypoint ${sequence} as MISSION_ITEM_INT: ${item.lat}, ${item.lng}`);
+      : `Sent waypoint ${sequence} as MISSION_ITEM_INT: ${item.lat}, ${item.lng}, hold=${waitSeconds}s`);
   }
 }
 
@@ -911,6 +914,7 @@ function missionItemsMatchReadback(expected: MissionItem[], actual: ParsedMissio
     if (expectedItem.type === 'home') continue;
     if (Math.abs(actualItem.lat - expectedItem.lat) > 0.00001) return false;
     if (Math.abs(actualItem.lng - expectedItem.lng) > 0.00001) return false;
+    if (expectedItem.type === 'waypoint' && Math.round(actualItem.param1) !== sanitizeWaitSeconds(expectedItem.waitSeconds)) return false;
   }
   return true;
 }
@@ -950,7 +954,10 @@ function uploadMission(waypoints: Waypoint[], loopCount = 1): { ok: boolean; mes
   logEventFromState('info', 'mission', 'upload_started', `Mission upload started with ${missionItems.length} items`, {
     waypointCount: waypoints.length,
     itemCount: missionItems.length,
-    loopCount
+    loopCount,
+    waypointWaits: missionItems
+      .filter((item): item is Waypoint & { type: 'waypoint'; altitude?: number } => item.type === 'waypoint')
+      .map((item) => ({ order: item.order, waitSeconds: sanitizeWaitSeconds(item.waitSeconds) }))
   });
 
   clearMissionUploadTimers();
@@ -1012,7 +1019,8 @@ function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvS
   items.push(...waypoints.map((point, index) => ({
     ...point,
     order: index + 1,
-    type: 'waypoint' as const
+    type: 'waypoint' as const,
+    waitSeconds: sanitizeWaitSeconds(point.waitSeconds)
   })));
 
   if (sanitizedLoopCount > 1 && waypoints.length > 0) {
@@ -1035,6 +1043,12 @@ function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvS
   }
 
   return items;
+}
+
+function sanitizeWaitSeconds(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value ?? 0);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(WAYPOINT_WAIT_MIN_SECONDS, Math.min(WAYPOINT_WAIT_MAX_SECONDS, Math.round(numeric)));
 }
 
 function handleMissionReached(seq: number): void {

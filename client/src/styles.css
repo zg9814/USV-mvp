@@ -745,7 +745,7 @@ button:disabled {
   border-radius: 8px;
   display: grid;
   gap: 8px;
-  grid-template-columns: 26px 1fr;
+  grid-template-columns: 26px minmax(0, 1fr);
   min-height: 34px;
   padding: 6px 8px;
 }
@@ -766,6 +766,33 @@ button:disabled {
 .route-panel p {
   color: #40514d;
   font-size: 13px;
+}
+
+.waypoint-main {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.waypoint-main > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.waypoint-wait {
+  align-items: center;
+  color: #657873;
+  display: grid;
+  gap: 5px;
+  grid-template-columns: auto 58px auto;
+  white-space: nowrap;
+}
+
+.waypoint-wait input {
+  height: 28px;
+  padding: 0 6px;
 }
 
 .route-panel p {
@@ -1019,6 +1046,44 @@ progress {
 .voltage-alarm__panel p {
   color: #40514d;
   margin: 0;
+}
+
+.voltage-alarm-icon {
+  align-items: center;
+  background: #b42318;
+  border: 2px solid #ffffff;
+  border-radius: 999px;
+  bottom: 18px;
+  box-shadow: 0 12px 30px rgba(23, 33, 31, 0.25);
+  color: #ffffff;
+  display: inline-grid;
+  gap: 7px;
+  grid-template-columns: 24px auto;
+  height: 44px;
+  padding: 0 14px 0 9px;
+  position: fixed;
+  right: 18px;
+  width: auto;
+  z-index: 1900;
+}
+
+.voltage-alarm-icon span {
+  align-items: center;
+  background: #ffffff;
+  border-radius: 50%;
+  color: #b42318;
+  display: flex;
+  font-size: 18px;
+  font-weight: 900;
+  height: 24px;
+  justify-content: center;
+  line-height: 1;
+  width: 24px;
+}
+
+.voltage-alarm-icon b {
+  font-size: 14px;
+  line-height: 1;
 }
 
 @media (max-width: 900px) {

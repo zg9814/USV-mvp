@@ -565,11 +565,12 @@ export function buildMissionItemInt(
   lng: number,
   altitude: number = 0,
   command: number = 16,
-  frame: number = 6
+  frame: number = 6,
+  holdTimeSeconds: number = 0
 ): Buffer {
   const MAV_MISSION_TYPE_MISSION = 0;
   const payload = Buffer.alloc(38);
-  payload.writeFloatLE(0, 0);             // param1: hold time
+  payload.writeFloatLE(holdTimeSeconds, 0); // param1: hold time
   payload.writeFloatLE(0, 4);             // param2: acceptance radius (use vehicle default)
   payload.writeFloatLE(0, 8);             // param3: pass radius
   payload.writeFloatLE(0, 12);            // param4: yaw
@@ -594,12 +595,13 @@ export function buildMissionItem(
   lat: number,
   lng: number,
   altitude: number = 0,
-  command: number = 16
+  command: number = 16,
+  holdTimeSeconds: number = 0
 ): Buffer {
   const MAV_FRAME_GLOBAL_RELATIVE_ALT = 3;
   const MAV_MISSION_TYPE_MISSION = 0;
   const payload = Buffer.alloc(38);
-  payload.writeFloatLE(0, 0);             // param1: hold time
+  payload.writeFloatLE(holdTimeSeconds, 0); // param1: hold time
   payload.writeFloatLE(0, 4);             // param2: acceptance radius (use vehicle default)
   payload.writeFloatLE(0, 8);             // param3: pass radius
   payload.writeFloatLE(0, 12);            // param4: yaw

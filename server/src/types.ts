@@ -43,6 +43,7 @@ export type Waypoint = {
   lat: number;
   lng: number;
   order: number;
+  waitSeconds?: number;
 };
 
 export type MissionItem =

@@ -32,6 +32,8 @@ let nextMissionRequestSeq = 0;
 let activeMissionSeq = 0;
 let lastReachedSeq = -1;
 let missionStartedAt = 0;
+let missionWaitSeq: number | null = null;
+let missionWaitUntil = 0;
 let cloudRemote = { address: cloudHost, port: cloudPort };
 
 socket.on('message', (packet, remote) => {
@@ -69,6 +71,8 @@ function handleCloudFrame(frame: MavlinkFrame): void {
       activeMissionSeq = frame.payload.length >= 2 ? frame.payload.readUInt16LE(0) : 0;
       missionStartedAt = Date.now();
       lastReachedSeq = activeMissionSeq - 1;
+      missionWaitSeq = null;
+      missionWaitUntil = 0;
       send(missionCurrent(activeMissionSeq));
       break;
     case 44:
@@ -78,6 +82,8 @@ function handleCloudFrame(frame: MavlinkFrame): void {
       missionItems = [];
       expectedMissionCount = 0;
       nextMissionRequestSeq = 0;
+      missionWaitSeq = null;
+      missionWaitUntil = 0;
       send(buildMissionAck(255, 190, 0));
       break;
     case 73:
@@ -156,9 +162,21 @@ function updateMotion(): void {
     const target = missionItems[activeMissionSeq];
     if (target) moveToward({ lat: target.lat, lng: target.lng }, 1.8);
     if (target && distanceMeters({ lat, lng }, target) <= 4 && lastReachedSeq < activeMissionSeq) {
+      const waitMs = Math.max(0, Math.round(target.param1 || 0)) * 1000;
+      if (waitMs > 0) {
+        if (missionWaitSeq !== activeMissionSeq) {
+          missionWaitSeq = activeMissionSeq;
+          missionWaitUntil = Date.now() + waitMs;
+          console.log(`SIM mission wait seq=${activeMissionSeq} seconds=${Math.round(waitMs / 1000)}`);
+          return;
+        }
+        if (Date.now() < missionWaitUntil) return;
+      }
       lastReachedSeq = activeMissionSeq;
       send(missionReached(activeMissionSeq));
       activeMissionSeq = Math.min(activeMissionSeq + 1, missionItems.length - 1);
+      missionWaitSeq = null;
+      missionWaitUntil = 0;
       send(missionCurrent(activeMissionSeq));
     }
   }

@@ -43,6 +43,7 @@ type Waypoint = {
   lat: number;
   lng: number;
   order: number;
+  waitSeconds: number;
 };
 
 type MapPoint = {
@@ -173,6 +174,11 @@ const missionCurrentLoop = ref(1);
 const lastMissionSeq = ref<number | null>(null);
 const MISSION_LOOP_MIN = 1;
 const MISSION_LOOP_MAX = 10;
+const WAYPOINT_WAIT_MIN_SECONDS = 0;
+const WAYPOINT_WAIT_MAX_SECONDS = 600;
+const LOW_VOLTAGE_ALARM_THRESHOLD = 22;
+const LOW_VOLTAGE_ALARM_SAMPLES = 5;
+const LOW_VOLTAGE_ALARM_SAMPLE_MS = 1000;
 const mission = reactive<MissionState>({
   status: 'idle',
   waypoints: [],
@@ -205,7 +211,8 @@ const displayShipPoint = ref<MapPoint | null>(null);
 const displayTrack = ref<MapPoint[]>([]);
 const activeView = ref<'console' | 'logs'>('console');
 const homePickingEnabled = ref(false);
-const lowVoltageMuted = ref(false);
+const lowVoltageMinimized = ref(false);
+const lowVoltageAlarmActive = ref(false);
 const logFilters = reactive({
   from: toLocalDateInput(new Date(Date.now() - 60 * 60 * 1000)),
   to: toLocalDateInput(new Date()),
@@ -236,6 +243,10 @@ let mapInitPromise: Promise<void> | null = null;
 let mapPointerStart: { x: number; y: number } | null = null;
 let suppressNextMapClick = false;
 let mapImageObserver: MutationObserver | null = null;
+let lowVoltageAlarmSampleCount = 0;
+let lastLowVoltageAlarmSampleAt = 0;
+let lowVoltageAudioContext: AudioContext | null = null;
+let lowVoltageAlarmSoundTimer: number | null = null;
 
 const voltageLabel = computed(() => state.voltage == null ? '--' : `${state.voltage.toFixed(2)} V`);
 const speedLabel = computed(() => state.speed == null ? '--' : `${state.speed.toFixed(2)} m/s`);
@@ -269,8 +280,9 @@ const homeStatusLabel = computed(() => {
   };
   return labels[home.syncStatus];
 });
-const lowVoltageActive = computed(() => state.voltage !== null && state.voltage < 22);
-const showLowVoltageAlarm = computed(() => lowVoltageActive.value && !lowVoltageMuted.value);
+const lowVoltageActive = computed(() => lowVoltageAlarmActive.value);
+const showLowVoltageAlarm = computed(() => lowVoltageActive.value && !lowVoltageMinimized.value);
+const showLowVoltageAlarmIcon = computed(() => lowVoltageActive.value && lowVoltageMinimized.value);
 const missionLoopProgressLabel = computed(() => {
   if (mission.status !== 'active' && mission.status !== 'paused') return '';
   return `任务进行中 ${missionCurrentLoop.value}/${missionActiveLoopCount.value}`;
@@ -293,12 +305,15 @@ watch(track, updateMapOverlays, { deep: true });
 watch(waypoints, updateRouteOverlays, { deep: true });
 watch(() => home.point, updateHomeOverlay, { deep: true });
 watch(() => [state.lat, state.lng, state.heading, state.online], updateMapOverlays);
-watch(() => state.voltage, (voltage) => {
-  if (voltage !== null && voltage >= 22) lowVoltageMuted.value = false;
+watch(showLowVoltageAlarm, (visible) => {
+  if (visible) startLowVoltageAlarmSound();
+  else stopLowVoltageAlarmSound();
 });
 
 onMounted(() => {
   connectWs();
+  window.addEventListener('pointerdown', unlockLowVoltageAlarmAudio, { once: true });
+  window.addEventListener('keydown', unlockLowVoltageAlarmAudio, { once: true });
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('blur', zeroControl);
@@ -325,6 +340,8 @@ onBeforeUnmount(() => {
   ws?.close();
   if (controlTimer) window.clearInterval(controlTimer);
   if (reconnectTimer) window.clearTimeout(reconnectTimer);
+  window.removeEventListener('pointerdown', unlockLowVoltageAlarmAudio);
+  window.removeEventListener('keydown', unlockLowVoltageAlarmAudio);
   window.removeEventListener('keydown', onKeyDown);
   window.removeEventListener('keyup', onKeyUp);
   window.removeEventListener('blur', zeroControl);
@@ -344,6 +361,7 @@ onBeforeUnmount(() => {
   mapContainer?.removeEventListener('mouseup', onMapPointerUp, true);
   mapContainer?.removeEventListener('dragstart', onMapDragStart);
   mapImageObserver?.disconnect();
+  stopLowVoltageAlarmSound();
   resetJoystick();
 });
 
@@ -358,7 +376,9 @@ function connectWs() {
   ws.addEventListener('message', (event) => {
     const message = JSON.parse(event.data);
     if (message.type === 'usv.telemetry') {
+      const wasOnline = state.online;
       Object.assign(state, message.data);
+      observeLowVoltageAlarm(wasOnline);
       if (message.data.mission) Object.assign(mission, message.data.mission);
       if (state.lat != null && state.lng != null) {
         const now = Date.now();
@@ -502,8 +522,101 @@ function returnHomeNow() {
   send('control.returnHome');
 }
 
-function muteLowVoltageAlarm() {
-  lowVoltageMuted.value = true;
+function minimizeLowVoltageAlarm() {
+  lowVoltageMinimized.value = true;
+  stopLowVoltageAlarmSound();
+}
+
+function expandLowVoltageAlarm() {
+  lowVoltageMinimized.value = false;
+  unlockLowVoltageAlarmAudio();
+}
+
+function observeLowVoltageAlarm(wasOnline: boolean) {
+  if (!state.online) {
+    resetLowVoltageAlarm(false);
+    return;
+  }
+
+  if (!wasOnline && state.online) {
+    resetLowVoltageAlarm(true);
+  }
+
+  const now = Date.now();
+  if (now - lastLowVoltageAlarmSampleAt < LOW_VOLTAGE_ALARM_SAMPLE_MS) return;
+  lastLowVoltageAlarmSampleAt = now;
+
+  if (state.voltage !== null && state.voltage < LOW_VOLTAGE_ALARM_THRESHOLD) {
+    lowVoltageAlarmSampleCount += 1;
+    if (lowVoltageAlarmSampleCount >= LOW_VOLTAGE_ALARM_SAMPLES) {
+      lowVoltageAlarmActive.value = true;
+    }
+    return;
+  }
+
+  lowVoltageAlarmSampleCount = 0;
+  lowVoltageAlarmActive.value = false;
+}
+
+function resetLowVoltageAlarm(clearMuted: boolean) {
+  lowVoltageAlarmSampleCount = 0;
+  lastLowVoltageAlarmSampleAt = 0;
+  lowVoltageAlarmActive.value = false;
+  if (clearMuted) lowVoltageMinimized.value = false;
+}
+
+function unlockLowVoltageAlarmAudio() {
+  const AudioContextCtor = window.AudioContext
+    ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextCtor) return;
+  lowVoltageAudioContext ??= new AudioContextCtor();
+  if (lowVoltageAudioContext.state === 'suspended') {
+    void lowVoltageAudioContext.resume()
+      .then(() => {
+        if (showLowVoltageAlarm.value) playLowVoltageBeep();
+      })
+      .catch(() => undefined);
+    return;
+  }
+  if (showLowVoltageAlarm.value) playLowVoltageBeep();
+}
+
+function enableLowVoltageAlarmSound() {
+  unlockLowVoltageAlarmAudio();
+  playLowVoltageBeep();
+}
+
+function startLowVoltageAlarmSound() {
+  unlockLowVoltageAlarmAudio();
+  if (lowVoltageAlarmSoundTimer !== null) return;
+  playLowVoltageBeep();
+  lowVoltageAlarmSoundTimer = window.setInterval(playLowVoltageBeep, 900);
+}
+
+function stopLowVoltageAlarmSound() {
+  if (lowVoltageAlarmSoundTimer === null) return;
+  window.clearInterval(lowVoltageAlarmSoundTimer);
+  lowVoltageAlarmSoundTimer = null;
+}
+
+function playLowVoltageBeep() {
+  const context = lowVoltageAudioContext;
+  if (!context || context.state !== 'running') return;
+
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+  const now = context.currentTime;
+
+  oscillator.type = 'square';
+  oscillator.frequency.setValueAtTime(880, now);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.28, now + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.22);
 }
 
 async function loadLogs() {
@@ -1097,7 +1210,8 @@ function addWaypoint(lnglat: any) {
     {
       lng: lnglat.lng ?? lnglat.getLng(),
       lat: lnglat.lat ?? lnglat.getLat(),
-      order: waypoints.value.length + 1
+      order: waypoints.value.length + 1,
+      waitSeconds: 0
     }
   ];
 }
@@ -1187,6 +1301,15 @@ function setMissionLoopCount(event: Event) {
   const input = event.target as HTMLInputElement;
   const value = Math.round(Number(input.value));
   missionLoopCount.value = clamp(Number.isFinite(value) ? value : 1, MISSION_LOOP_MIN, MISSION_LOOP_MAX);
+}
+
+function setWaypointWait(point: Waypoint, event: Event) {
+  const input = event.target as HTMLInputElement;
+  const value = Math.round(Number(input.value));
+  const waitSeconds = clamp(Number.isFinite(value) ? value : 0, WAYPOINT_WAIT_MIN_SECONDS, WAYPOINT_WAIT_MAX_SECONDS);
+  waypoints.value = waypoints.value.map((item) => (
+    item.order === point.order ? { ...item, waitSeconds } : item
+  ));
 }
 
 function calculateRouteLength(points: Waypoint[]) {
@@ -1352,9 +1475,21 @@ function bindMapMoveEvents() {
         <strong>低电压报警</strong>
         <span>当前电压 {{ voltageLabel }}，低于 22.00 V</span>
         <p>请关注返航状态；连续低于 21.60 V 将自动触发返航。</p>
-        <button @click="muteLowVoltageAlarm">确认并静音</button>
+        <button @click="enableLowVoltageAlarmSound">启用声音</button>
+        <button @click="minimizeLowVoltageAlarm">静音并最小化</button>
       </div>
     </div>
+
+    <button
+      v-if="showLowVoltageAlarmIcon"
+      class="voltage-alarm-icon"
+      type="button"
+      title="低电压报警"
+      @click="expandLowVoltageAlarm"
+    >
+      <span>!</span>
+      <b>{{ voltageLabel }}</b>
+    </button>
 
     <section v-if="activeView === 'console'" class="layout">
       <div class="map-panel">
@@ -1517,7 +1652,20 @@ function bindMapMoveEvents() {
           <ol v-if="waypoints.length > 0" class="waypoint-list">
             <li v-for="point in waypoints" :key="point.order">
               <b>{{ point.order }}</b>
-              <span>{{ point.lng.toFixed(6) }}, {{ point.lat.toFixed(6) }}</span>
+              <div class="waypoint-main">
+                <span>{{ point.lng.toFixed(6) }}, {{ point.lat.toFixed(6) }}</span>
+                <label class="waypoint-wait">
+                  <span>等待</span>
+                  <input
+                    type="number"
+                    :min="WAYPOINT_WAIT_MIN_SECONDS"
+                    :max="WAYPOINT_WAIT_MAX_SECONDS"
+                    :value="point.waitSeconds"
+                    @input="setWaypointWait(point, $event)"
+                  />
+                  <span>秒</span>
+                </label>
+              </div>
             </li>
           </ol>
           <p v-else>在地图上点击添加航点</p>
