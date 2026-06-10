@@ -9,6 +9,7 @@ import {
   buildManualControl,
   buildRcChannelsOverride,
   buildRebootAutopilot,
+  buildSetHome,
   buildSetMode,
   buildMissionCount,
   buildMissionItemInt,
@@ -48,8 +49,13 @@ const CONTROL_TIMEOUT_MS = Number(process.env.CONTROL_TIMEOUT_MS ?? 500);
 const REBOOT_DISARM_WAIT_MS = Number(process.env.REBOOT_DISARM_WAIT_MS ?? 3000);
 const REBOOT_DISARM_POLL_MS = Number(process.env.REBOOT_DISARM_POLL_MS ?? 100);
 const COMM_LOG_INTERVAL_MS = Number(process.env.COMM_LOG_INTERVAL_MS ?? 1000);
+const COMM_TELEMETRY_LOG_INTERVAL_MS = Number(process.env.COMM_TELEMETRY_LOG_INTERVAL_MS ?? 10000);
 const COMM_LOW_VOLTAGE = Number(process.env.COMM_LOW_VOLTAGE ?? 20);
 const COMM_VOLTAGE_DROP = Number(process.env.COMM_VOLTAGE_DROP ?? 2);
+const RETURN_HOME_LOW_VOLTAGE = Number(process.env.RETURN_HOME_LOW_VOLTAGE ?? 21.6);
+const RETURN_HOME_LOW_VOLTAGE_SAMPLES = Number(process.env.RETURN_HOME_LOW_VOLTAGE_SAMPLES ?? 5);
+const RETURN_HOME_RESET_VOLTAGE = Number(process.env.RETURN_HOME_RESET_VOLTAGE ?? 22);
+const RETURN_HOME_ARRIVAL_RADIUS_M = Number(process.env.RETURN_HOME_ARRIVAL_RADIUS_M ?? 5);
 const LOG_RAW_MAVLINK = process.env.LOG_RAW_MAVLINK === '1';
 const EVENT_DB_PATH = process.env.EVENT_DB_PATH ?? 'data/usv-events.sqlite';
 const EVENT_LOG_RETENTION_DAYS = Number(process.env.EVENT_LOG_RETENTION_DAYS ?? 30);
@@ -85,6 +91,47 @@ let lastManualControlLogAt = 0;
 let pendingRebootAfterDisarmTimer: NodeJS.Timeout | null = null;
 let lastTelemetrySampleAt = 0;
 let lastOnlineLogged: boolean | null = null;
+let homeState: HomeState = {
+  point: null,
+  syncStatus: 'unset',
+  lastSyncAt: null,
+  lastAckAt: null,
+  lastResult: null,
+  lastError: null
+};
+let returnHomeState: ReturnHomeState = {
+  active: false,
+  reason: null,
+  startedAt: null,
+  completedAt: null,
+  lastDistanceMeters: null
+};
+let lowVoltageReturnCount = 0;
+let lowVoltageReturnTriggered = false;
+let lastLowVoltageReturnSampleAt = 0;
+
+type HomePoint = {
+  lat: number;
+  lng: number;
+  altitude: number | null;
+};
+
+type HomeState = {
+  point: HomePoint | null;
+  syncStatus: 'unset' | 'pending' | 'accepted' | 'rejected' | 'failed';
+  lastSyncAt: string | null;
+  lastAckAt: string | null;
+  lastResult: string | null;
+  lastError: string | null;
+};
+
+type ReturnHomeState = {
+  active: boolean;
+  reason: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  lastDistanceMeters: number | null;
+};
 
 eventLog.cleanup();
 eventLog.logEvent({
@@ -188,6 +235,7 @@ udp.on('message', (packet, remote) => {
             result: ack.result,
             resultName: ack.resultName
           }, ack.command, ack.resultName, frame.raw.toString('hex'));
+          handleCommandAck(ack.command, ack.resultName);
           broadcast('usv.statusText', {
             deviceId: state.deviceId,
             severity: ack.result === 0 ? 6 : 4,
@@ -258,6 +306,7 @@ udp.on('message', (packet, remote) => {
         const reached = parseMissionItemReached(frame.payload);
         if (reached) {
           broadcast('mission.reached', { seq: reached.seq });
+          handleMissionReached(reached.seq);
         }
         break;
       }
@@ -282,7 +331,7 @@ udp.on('message', (packet, remote) => {
     }
   }
 
-  if (frames.length > 0 && packetHadTelemetry && Date.now() - lastCommLogAt >= COMM_LOG_INTERVAL_MS) {
+  if (frames.length > 0 && packetHadTelemetry && Date.now() - lastCommLogAt >= COMM_TELEMETRY_LOG_INTERVAL_MS) {
     logCommSummary(remoteKey, messageIds, packetVoltage, packetCurrent, packetBattery);
   }
 
@@ -305,6 +354,7 @@ function readSysStatusCurrent(payload: Buffer): number | null {
 function observeVoltage(source: string, voltage: number | null, current: number | null, battery: number | null, remote: string): void {
   if (voltage === null || !Number.isFinite(voltage)) return;
   const now = Date.now();
+  observeReturnHomeVoltage(source, voltage, current, battery, remote);
   if (voltage <= COMM_LOW_VOLTAGE) {
     console.warn(`COMM ALERT low_voltage source=${source} remote=${remote} voltage=${voltage.toFixed(3)} current=${formatNumber(current, 2)} battery=${formatPercent(battery)}`);
     if (now - lastLowVoltageLogAt >= 60_000) {
@@ -522,6 +572,178 @@ function splitRemote(remote: string): { address: string; port: number | null } {
     address: remote.slice(0, index),
     port: Number.isFinite(port) ? port : null
   };
+}
+
+function handleCommandAck(command: number, resultName: string): void {
+  if (command !== 179) return;
+  homeState = {
+    ...homeState,
+    syncStatus: resultName === 'ACCEPTED' ? 'accepted' : 'rejected',
+    lastAckAt: new Date().toISOString(),
+    lastResult: resultName,
+    lastError: resultName === 'ACCEPTED' ? null : `SET_HOME rejected: ${resultName}`
+  };
+  broadcast('home.syncAck', publicHomeState());
+  logEventFromState(resultName === 'ACCEPTED' ? 'info' : 'warn', 'home', 'set_home_ack', `SET_HOME ${resultName}`, {
+    result: resultName,
+    home: homeState.point
+  }, 179, resultName);
+}
+
+function setHomeFromInput(input: unknown): { ok: boolean; message: string; data?: HomeState } {
+  const payload = input as { lat?: number; lng?: number; altitude?: number | null };
+  const lat = Number(payload?.lat);
+  const lng = Number(payload?.lng);
+  const altitudeValue = payload?.altitude === null || payload?.altitude === undefined ? null : Number(payload.altitude);
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+    return { ok: false, message: 'invalid home coordinates' };
+  }
+  if (altitudeValue !== null && !Number.isFinite(altitudeValue)) {
+    return { ok: false, message: 'invalid home altitude' };
+  }
+
+  homeState = {
+    point: { lat, lng, altitude: altitudeValue },
+    syncStatus: 'pending',
+    lastSyncAt: new Date().toISOString(),
+    lastAckAt: null,
+    lastResult: null,
+    lastError: null
+  };
+  broadcast('home.updated', publicHomeState());
+  logEventFromState('info', 'home', 'home_set', 'Home point set from client', { home: homeState.point });
+
+  const syncResult = syncHomeToAutopilot();
+  if (!syncResult.ok) {
+    homeState = {
+      ...homeState,
+      syncStatus: 'failed',
+      lastError: syncResult.message
+    };
+    broadcast('home.updated', publicHomeState());
+    return { ok: false, message: syncResult.message, data: homeState };
+  }
+
+  return { ok: true, message: 'home set and sync requested', data: homeState };
+}
+
+function syncHomeToAutopilot(): { ok: boolean; message: string } {
+  const state = store.getState();
+  const home = homeState.point;
+  if (!home) return { ok: false, message: 'home is not set' };
+  if (!state.online || !state.remote) return { ok: false, message: 'USV offline or remote endpoint unknown' };
+
+  const frame = buildSetHome(state.systemId, state.componentId || 1, home.lat, home.lng, home.altitude ?? state.gpsAltitude ?? 0);
+  logControlTx('setHome', { lat: home.lat, lng: home.lng, altitude: home.altitude ?? state.gpsAltitude ?? 0 }, true, frame.toString('hex'), 179);
+  udp.send(frame, state.remote.port, state.remote.address);
+  return { ok: true, message: 'set home sent' };
+}
+
+function startReturnHome(reason: string): { ok: boolean; message: string } {
+  const state = store.getState();
+  if (!homeState.point) return { ok: false, message: 'home is not set' };
+  if (homeState.syncStatus !== 'accepted') return { ok: false, message: 'home has not been accepted by autopilot' };
+  if (!state.online || !state.remote) return { ok: false, message: 'USV offline or remote endpoint unknown' };
+
+  const frames = buildSetMode(state.systemId, state.componentId || 1, 'rtl', state.autopilot);
+  logControlTx('returnHome', { reason, lat: homeState.point.lat, lng: homeState.point.lng }, true, frames.at(-1)?.toString('hex') ?? null, 176);
+  for (const frame of frames) udp.send(frame, state.remote.port, state.remote.address);
+  returnHomeState = {
+    active: true,
+    reason,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    lastDistanceMeters: distanceToHome(state)
+  };
+  store.setMissionStatus('active');
+  broadcast('return.home', publicReturnHomeState());
+  broadcast('control.sent', { action: 'returnHome', reason });
+  logEventFromState(reason === 'low_voltage' ? 'warn' : 'info', 'return_home', 'started', `Return home started (${reason})`, {
+    reason,
+    home: homeState.point,
+    distanceMeters: returnHomeState.lastDistanceMeters
+  });
+  return { ok: true, message: 'return home started' };
+}
+
+function observeReturnHomeArrival(): void {
+  if (!returnHomeState.active || !homeState.point) return;
+  const state = store.getState();
+  const distance = distanceToHome(state);
+  returnHomeState.lastDistanceMeters = distance;
+  if (distance === null || distance > RETURN_HOME_ARRIVAL_RADIUS_M) return;
+
+  for (const frame of buildSetMode(state.systemId, state.componentId || 1, 'hold', state.autopilot)) {
+    if (state.remote) udp.send(frame, state.remote.port, state.remote.address);
+  }
+  returnHomeState = {
+    ...returnHomeState,
+    active: false,
+    completedAt: new Date().toISOString(),
+    lastDistanceMeters: distance
+  };
+  store.setMissionStatus('completed');
+  broadcast('return.home', publicReturnHomeState());
+  broadcast('mission.completed', { reason: 'home-arrived', distanceMeters: distance });
+  logEventFromState('info', 'return_home', 'arrived', 'Return home arrived; HOLD sent', {
+    reason: returnHomeState.reason,
+    distanceMeters: distance,
+    radiusMeters: RETURN_HOME_ARRIVAL_RADIUS_M
+  });
+}
+
+function observeReturnHomeVoltage(source: string, voltage: number, current: number | null, battery: number | null, remote: string): void {
+  const now = Date.now();
+  if (now - lastLowVoltageReturnSampleAt < 1000) return;
+  lastLowVoltageReturnSampleAt = now;
+  if (voltage >= RETURN_HOME_RESET_VOLTAGE) {
+    lowVoltageReturnCount = 0;
+    lowVoltageReturnTriggered = false;
+    return;
+  }
+  if (voltage >= RETURN_HOME_LOW_VOLTAGE) return;
+  lowVoltageReturnCount += 1;
+  if (lowVoltageReturnTriggered || lowVoltageReturnCount < RETURN_HOME_LOW_VOLTAGE_SAMPLES) return;
+  lowVoltageReturnTriggered = true;
+  logEventFromState('warn', 'power', 'low_voltage_return_home', `Low voltage return home triggered at ${voltage.toFixed(3)} V`, {
+    source,
+    voltage,
+    current,
+    battery,
+    remote,
+    threshold: RETURN_HOME_LOW_VOLTAGE,
+    samples: lowVoltageReturnCount
+  });
+  const result = startReturnHome('low_voltage');
+  if (!result.ok) {
+    logEventFromState('error', 'return_home', 'auto_return_failed', result.message, {
+      source,
+      voltage,
+      home: homeState.point,
+      homeSyncStatus: homeState.syncStatus
+    });
+  }
+}
+
+function distanceToHome(state: UsvState): number | null {
+  if (!homeState.point || state.lat === null || state.lng === null) return null;
+  return haversineMeters({ lat: state.lat, lng: state.lng }, homeState.point);
+}
+
+function haversineMeters(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
+  const earthRadiusMeters = 6371008.8;
+  const lat1 = toRadians(a.lat);
+  const lat2 = toRadians(b.lat);
+  const deltaLat = toRadians(b.lat - a.lat);
+  const deltaLng = toRadians(b.lng - a.lng);
+  const sinLat = Math.sin(deltaLat / 2);
+  const sinLng = Math.sin(deltaLng / 2);
+  const value = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLng * sinLng;
+  return 2 * earthRadiusMeters * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
+}
+
+function toRadians(value: number): number {
+  return (value * Math.PI) / 180;
 }
 
 // ==================== 航线处理函数 ====================
@@ -802,7 +1024,46 @@ function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvS
     });
   }
 
+  if (homeState.point) {
+    items.push({
+      type: 'returnHome',
+      order: items.length,
+      lat: homeState.point.lat,
+      lng: homeState.point.lng,
+      altitude: homeState.point.altitude ?? state.gpsAltitude ?? 0
+    });
+  }
+
   return items;
+}
+
+function handleMissionReached(seq: number): void {
+  const mission = store.getMissionState();
+  const finalSeq = mission.totalWaypoints - 1;
+  if (mission.status !== 'active' || seq !== finalSeq || !homeState.point) return;
+  const finalItem = mission.waypoints[finalSeq];
+  if (!finalItem || finalItem.type !== 'returnHome') return;
+
+  returnHomeState = {
+    active: false,
+    reason: 'mission_complete',
+    startedAt: returnHomeState.startedAt,
+    completedAt: new Date().toISOString(),
+    lastDistanceMeters: distanceToHome(store.getState())
+  };
+  const state = store.getState();
+  if (state.online && state.remote) {
+    for (const frame of buildSetMode(state.systemId, state.componentId || 1, 'hold', state.autopilot)) {
+      udp.send(frame, state.remote.port, state.remote.address);
+    }
+  }
+  store.setMissionStatus('completed');
+  broadcast('mission.completed', { reason: 'mission-final-home', seq });
+  logEventFromState('info', 'mission', 'completed_at_home', 'Mission completed at return home; HOLD sent', {
+    seq,
+    home: homeState.point,
+    distanceMeters: returnHomeState.lastDistanceMeters
+  });
 }
 
 function pauseMission(): { ok: boolean; message: string } {
@@ -888,6 +1149,16 @@ const httpServer = http.createServer(async (req, res) => {
     return sendJson(res, 200, { code: 200, data: store.getMissionState() });
   }
 
+  if (url.pathname === '/api/home' && req.method === 'GET') {
+    return sendJson(res, 200, { code: 200, data: publicHomeState() });
+  }
+
+  if (url.pathname === '/api/home' && req.method === 'POST') {
+    const body = await readBody(req);
+    const result = setHomeFromInput(body);
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
   if (url.pathname === '/api/logs/events') {
     return sendJson(res, 200, { code: 200, data: eventLog.queryEvents(eventQueryFromUrl(url)) });
   }
@@ -954,6 +1225,8 @@ const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 wss.on('connection', (ws) => {
   clients.add(ws);
   sendWs(ws, 'usv.telemetry', publicState());
+  sendWs(ws, 'home.updated', publicHomeState());
+  sendWs(ws, 'return.home', publicReturnHomeState());
 
   ws.on('message', (raw) => {
     try {
@@ -968,6 +1241,10 @@ wss.on('connection', (ws) => {
       if (message.type === 'control.arm') sendArm(true);
       if (message.type === 'control.disarm') sendArm(false);
       if (message.type === 'control.emergencyStop') sendEmergencyStop();
+      if (message.type === 'control.returnHome') {
+        const result = handleControl({ action: 'returnHome' });
+        if (!result.ok) sendWs(ws, 'error', { message: result.message });
+      }
       if (message.type === 'control.reboot') {
         const data = message.data as { confirmed?: boolean };
         const result = handleControl({ action: 'reboot', confirmed: data?.confirmed });
@@ -1027,6 +1304,7 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 setInterval(() => {
   broadcastState();
   observeOnlineState();
+  observeReturnHomeArrival();
   sampleTelemetry();
   if (lastManualInputAt > 0 && Date.now() - lastManualInputAt > CONTROL_TIMEOUT_MS) {
     if (Date.now() - lastSentZeroAt > CONTROL_TIMEOUT_MS) {
@@ -1041,6 +1319,7 @@ function handleControl(body: unknown): { ok: boolean; message: string } {
   if (payload.action === 'arm') return sendArm(true);
   if (payload.action === 'disarm') return sendArm(false);
   if (payload.action === 'emergencyStop') return sendEmergencyStop();
+  if (payload.action === 'returnHome') return startReturnHome('manual');
   if (payload.action === 'reboot') {
     if (payload.confirmed !== true) return { ok: false, message: 'reboot requires confirmation' };
     return sendRebootAutopilot();
@@ -1128,7 +1407,9 @@ function sendManualControl(input: ManualControlInput, markInput = true): { ok: b
     buildManualControl(state.systemId, input),
     buildRcChannelsOverride(state.systemId, state.componentId || 1, input)
   ];
-  logControlTx('manual', { throttle: input.throttle.toFixed(2), steering: input.steering.toFixed(2), markInput }, !markInput, frames[0].toString('hex'));
+  if (input.throttle !== 0 || input.steering !== 0) {
+    logControlTx('manual', { throttle: input.throttle.toFixed(2), steering: input.steering.toFixed(2), markInput }, false, frames[0].toString('hex'));
+  }
   for (const frame of frames) udp.send(frame, state.remote.port, state.remote.address);
   broadcast('control.sent', { action: 'manual', input });
   return { ok: true, message: 'manual control sent' };
@@ -1245,14 +1526,33 @@ function scheduleRebootAfterDisarm(): void {
   pendingRebootAfterDisarmTimer = setTimeout(checkDisarmed, REBOOT_DISARM_POLL_MS);
 }
 
-function publicState(): Omit<UsvState, 'remote'> & { remoteKnown: boolean; udpPort: number; mission: ReturnType<typeof store.getMissionState> } {
+function publicState(): Omit<UsvState, 'remote'> & {
+  remoteKnown: boolean;
+  udpPort: number;
+  mission: ReturnType<typeof store.getMissionState>;
+  home: HomeState;
+  returnHome: ReturnHomeState;
+} {
   const { remote, ...state } = store.getState();
   return {
     ...state,
     remoteKnown: remote !== null,
     udpPort: UDP_PORT,
-    mission: store.getMissionState()
+    mission: store.getMissionState(),
+    home: publicHomeState(),
+    returnHome: publicReturnHomeState()
   };
+}
+
+function publicHomeState(): HomeState {
+  return {
+    ...homeState,
+    point: homeState.point ? { ...homeState.point } : null
+  };
+}
+
+function publicReturnHomeState(): ReturnHomeState {
+  return { ...returnHomeState };
 }
 
 function broadcastState(): void {

@@ -46,7 +46,7 @@ export type Waypoint = {
 };
 
 export type MissionItem =
-  | (Waypoint & { type?: 'waypoint' | 'home'; altitude?: number })
+  | (Waypoint & { type?: 'waypoint' | 'home' | 'returnHome'; altitude?: number })
   | {
       type: 'doJump';
       order: number;

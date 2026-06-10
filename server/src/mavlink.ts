@@ -182,6 +182,10 @@ export function buildRebootAutopilot(targetSystem: number, targetComponent: numb
   return buildCommandLong(targetSystem, targetComponent, 246, [1, 0, 0, 0, 0, 0, 0]);
 }
 
+export function buildSetHome(targetSystem: number, targetComponent: number, lat: number, lng: number, altitude: number = 0): Buffer {
+  return buildCommandLong(targetSystem, targetComponent, 179, [0, 0, 0, 0, lat, lng, altitude]);
+}
+
 export function buildEmergencyStop(targetSystem: number, targetComponent: number): Buffer[] {
   return [
     buildManualControl(targetSystem, { throttle: 0, steering: 0 }),

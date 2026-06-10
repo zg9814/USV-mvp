@@ -57,6 +57,23 @@ type MissionState = {
   totalWaypoints: number;
 };
 
+type HomeState = {
+  point: { lat: number; lng: number; altitude: number | null } | null;
+  syncStatus: 'unset' | 'pending' | 'accepted' | 'rejected' | 'failed';
+  lastSyncAt: string | null;
+  lastAckAt: string | null;
+  lastResult: string | null;
+  lastError: string | null;
+};
+
+type ReturnHomeState = {
+  active: boolean;
+  reason: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  lastDistanceMeters: number | null;
+};
+
 type EventLogRow = {
   id: number;
   occurred_at: string;
@@ -162,6 +179,21 @@ const mission = reactive<MissionState>({
   currentWaypoint: 0,
   totalWaypoints: 0
 });
+const home = reactive<HomeState>({
+  point: null,
+  syncStatus: 'unset',
+  lastSyncAt: null,
+  lastAckAt: null,
+  lastResult: null,
+  lastError: null
+});
+const returnHome = reactive<ReturnHomeState>({
+  active: false,
+  reason: null,
+  startedAt: null,
+  completedAt: null,
+  lastDistanceMeters: null
+});
 const shipOverlay = reactive({
   visible: false,
   left: 0,
@@ -172,6 +204,8 @@ const shipOverlay = reactive({
 const displayShipPoint = ref<MapPoint | null>(null);
 const displayTrack = ref<MapPoint[]>([]);
 const activeView = ref<'console' | 'logs'>('console');
+const homePickingEnabled = ref(false);
+const lowVoltageMuted = ref(false);
 const logFilters = reactive({
   from: toLocalDateInput(new Date(Date.now() - 60 * 60 * 1000)),
   to: toLocalDateInput(new Date()),
@@ -192,6 +226,7 @@ let mapContainer: HTMLDivElement | null = null;
 let map: any = null;
 let trackLine: any = null;
 let routeLine: any = null;
+let homeMarker: any = null;
 let waypointMarkers: any[] = [];
 let hasCenteredMap = false;
 let satelliteLayer: any = null;
@@ -223,6 +258,19 @@ const displayLatLabel = computed(() => displayShipPoint.value ? displayShipPoint
 const routeLengthMeters = computed(() => calculateRouteLength(waypoints.value));
 const routeLengthLabel = computed(() => formatDistance(routeLengthMeters.value));
 const missionUploadItemCount = computed(() => waypoints.value.length === 0 ? 0 : waypoints.value.length + 1 + (missionLoopCount.value > 1 ? 1 : 0));
+const homeLabel = computed(() => home.point ? `${home.point.lng.toFixed(7)}, ${home.point.lat.toFixed(7)}` : '未设置');
+const homeStatusLabel = computed(() => {
+  const labels: Record<HomeState['syncStatus'], string> = {
+    unset: '未设置',
+    pending: '同步中',
+    accepted: '已同步',
+    rejected: '已拒绝',
+    failed: '同步失败'
+  };
+  return labels[home.syncStatus];
+});
+const lowVoltageActive = computed(() => state.voltage !== null && state.voltage < 22);
+const showLowVoltageAlarm = computed(() => lowVoltageActive.value && !lowVoltageMuted.value);
 const missionLoopProgressLabel = computed(() => {
   if (mission.status !== 'active' && mission.status !== 'paused') return '';
   return `任务进行中 ${missionCurrentLoop.value}/${missionActiveLoopCount.value}`;
@@ -239,9 +287,15 @@ const modes = [
   { key: 'stabilized', label: '增稳' }
 ];
 
+const controlModes = computed(() => modes.filter((mode) => mode.key !== 'rtl'));
+
 watch(track, updateMapOverlays, { deep: true });
 watch(waypoints, updateRouteOverlays, { deep: true });
+watch(() => home.point, updateHomeOverlay, { deep: true });
 watch(() => [state.lat, state.lng, state.heading, state.online], updateMapOverlays);
+watch(() => state.voltage, (voltage) => {
+  if (voltage !== null && voltage >= 22) lowVoltageMuted.value = false;
+});
 
 onMounted(() => {
   connectWs();
@@ -256,6 +310,7 @@ onMounted(() => {
   document.addEventListener('mousemove', onDocumentMapPointerMove, true);
   document.addEventListener('mouseup', onDocumentMapPointerUp, true);
   initializeMap();
+  loadHome();
   controlTimer = window.setInterval(() => {
     pruneTrack();
     updateKeyboardControl();
@@ -362,6 +417,21 @@ function connectWs() {
       resetMissionLoopProgress();
       statusText.value = '航线已清除';
     }
+    if (message.type === 'mission.completed') {
+      mission.status = 'completed';
+      statusText.value = '任务已完成，已保持在返航点';
+    }
+    if (message.type === 'home.updated' || message.type === 'home.syncAck') {
+      Object.assign(home, message.data);
+      updateHomeOverlay();
+      statusText.value = home.syncStatus === 'accepted'
+        ? '返航点已同步到飞控'
+        : home.lastError || statusText.value;
+    }
+    if (message.type === 'return.home') {
+      Object.assign(returnHome, message.data);
+      if (returnHome.active) statusText.value = '正在返航';
+    }
   });
 
   ws.addEventListener('close', () => {
@@ -389,6 +459,51 @@ async function postJson<T = { ok: boolean; message?: string }>(url: string, data
     throw new Error(message);
   }
   return result;
+}
+
+async function loadHome() {
+  try {
+    const response = await fetch('/api/home');
+    const result = await response.json() as { data?: HomeState };
+    if (result.data) {
+      Object.assign(home, result.data);
+      updateHomeOverlay();
+    }
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+async function setHome(point: { lat: number; lng: number; altitude?: number | null }) {
+  try {
+    const result = await postJson<{ ok: boolean; message?: string; data?: HomeState }>('/api/home', point);
+    if (result.data) Object.assign(home, result.data);
+    updateHomeOverlay();
+    statusText.value = result.message || '返航点同步请求已发送';
+  } catch (error) {
+    statusText.value = `返航点设置失败：${error instanceof Error ? error.message : '未知错误'}`;
+  }
+}
+
+function setHomeFromCurrent() {
+  if (state.lat == null || state.lng == null) {
+    statusText.value = '当前没有可用 GPS，无法设为返航点';
+    return;
+  }
+  setHome({ lat: state.lat, lng: state.lng, altitude: state.gpsAltitude });
+}
+
+function toggleHomePicking() {
+  homePickingEnabled.value = !homePickingEnabled.value;
+  if (homePickingEnabled.value) planningEnabled.value = false;
+}
+
+function returnHomeNow() {
+  send('control.returnHome');
+}
+
+function muteLowVoltageAlarm() {
+  lowVoltageMuted.value = true;
 }
 
 async function loadLogs() {
@@ -788,6 +903,7 @@ async function initializeMapOnce() {
   showDebugShipMarker();
   updateMapOverlays();
   updateRouteOverlays();
+  updateHomeOverlay();
 }
 
 function setMapLayer(mode: 'vector' | 'satellite') {
@@ -952,6 +1068,29 @@ function updateRouteOverlays() {
   });
 }
 
+function updateHomeOverlay() {
+  if (!map || !window.T) return;
+  if (homeMarker) {
+    map.removeOverLay(homeMarker);
+    homeMarker = null;
+  }
+  if (!home.point) return;
+
+  const T = window.T;
+  const position = new T.LngLat(home.point.lng, home.point.lat);
+  const homeSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="34" height="34" viewBox="0 0 34 34">
+    <circle cx="17" cy="17" r="15" fill="#f97316" stroke="white" stroke-width="3"/>
+    <text x="17" y="22" text-anchor="middle" fill="white" font-size="15" font-weight="bold" font-family="Arial">H</text>
+  </svg>`;
+  const icon = new T.Icon({
+    iconUrl: 'data:image/svg+xml,' + encodeURIComponent(homeSvg),
+    iconSize: new T.Point(34, 34),
+    iconAnchor: new T.Point(17, 17)
+  });
+  homeMarker = new T.Marker(position, { icon });
+  map.addOverLay(homeMarker);
+}
+
 function addWaypoint(lnglat: any) {
   waypoints.value = [
     ...waypoints.value,
@@ -1108,11 +1247,20 @@ function onMapPointerMove(event: MouseEvent | PointerEvent) {
 }
 
 function onMapPointerUp(event: MouseEvent | PointerEvent) {
-  if (planningEnabled.value && mapPointerStart) {
+  if ((planningEnabled.value || homePickingEnabled.value) && mapPointerStart) {
     const moved = Math.hypot(event.clientX - mapPointerStart.x, event.clientY - mapPointerStart.y);
     if (moved <= 8) {
       const lnglat = getMapClickLngLat(event);
-      if (lnglat) addWaypoint(lnglat);
+      if (lnglat && homePickingEnabled.value) {
+        homePickingEnabled.value = false;
+        setHome({
+          lng: lnglat.lng ?? lnglat.getLng(),
+          lat: lnglat.lat ?? lnglat.getLat(),
+          altitude: state.gpsAltitude
+        });
+      } else if (lnglat && planningEnabled.value) {
+        addWaypoint(lnglat);
+      }
     }
   }
   mapPointerStart = null;
@@ -1198,6 +1346,15 @@ function bindMapMoveEvents() {
         <span class="pill" :class="{ ok: state.remoteKnown }">UDP {{ state.udpPort }}</span>
       </div>
     </section>
+
+    <div v-if="showLowVoltageAlarm" class="voltage-alarm" role="alert">
+      <div class="voltage-alarm__panel">
+        <strong>低电压报警</strong>
+        <span>当前电压 {{ voltageLabel }}，低于 22.00 V</span>
+        <p>请关注返航状态；连续低于 21.60 V 将自动触发返航。</p>
+        <button @click="muteLowVoltageAlarm">确认并静音</button>
+      </div>
+    </div>
 
     <section v-if="activeView === 'console'" class="layout">
       <div class="map-panel">
@@ -1329,6 +1486,20 @@ function bindMapMoveEvents() {
             <button @click="undoWaypoint" :disabled="waypoints.length === 0">撤销</button>
             <button @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
           </div>
+          <div class="home-panel">
+            <div class="home-panel__header">
+              <span>返航点 Home</span>
+              <strong :class="`home-status home-status--${home.syncStatus}`">{{ homeStatusLabel }}</strong>
+            </div>
+            <div class="home-panel__coords">{{ homeLabel }}</div>
+            <div v-if="home.lastError" class="home-panel__error">{{ home.lastError }}</div>
+            <div class="home-panel__actions">
+              <button @click="setHomeFromCurrent" :disabled="state.lat == null || state.lng == null">设为当前位置</button>
+              <button :class="{ active: homePickingEnabled }" @click="toggleHomePicking">
+                {{ homePickingEnabled ? '点击地图中' : '地图点选 Home' }}
+              </button>
+            </div>
+          </div>
           <div class="route-summary">
             <div><span>航线长度</span><strong>{{ routeLengthLabel }}</strong></div>
             <div><span>上传任务项</span><strong>{{ missionUploadItemCount }} 项</strong></div>
@@ -1384,7 +1555,7 @@ function bindMapMoveEvents() {
           <div class="mode-switch">
             <span>模式切换</span>
             <div>
-              <button v-for="mode in modes" :key="mode.key" @click="setMode(mode.key)">
+              <button v-for="mode in controlModes" :key="mode.key" @click="setMode(mode.key)">
                 {{ mode.label }}
               </button>
             </div>
@@ -1395,6 +1566,7 @@ function bindMapMoveEvents() {
             <button @click="command('control.disarm')">上锁</button>
             <button class="danger" @click="command('control.emergencyStop')">急停</button>
             <button class="danger" :disabled="!state.online" @click="rebootAutopilot">重启飞控</button>
+            <button @click="returnHomeNow" :disabled="home.syncStatus !== 'accepted' || !state.online">返航</button>
           </div>
 
           <div class="sticks">

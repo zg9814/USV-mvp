@@ -611,6 +611,78 @@ h1 {
   min-height: 36px;
 }
 
+.home-panel {
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.home-panel__header,
+.home-panel__actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.home-panel__header span {
+  color: #7c2d12;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.home-panel__coords {
+  color: #17211f;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.home-panel__error {
+  color: #b42318;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.home-panel__actions button {
+  min-height: 36px;
+  padding: 0 10px;
+}
+
+.home-panel__actions button.active {
+  background: #f97316;
+}
+
+.home-status {
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.home-status--accepted {
+  background: #ccebdc;
+  color: #05603a;
+}
+
+.home-status--pending {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.home-status--rejected,
+.home-status--failed {
+  background: #fee4e2;
+  color: #b42318;
+}
+
+.home-status--unset {
+  background: #e2e8e5;
+  color: #40514d;
+}
+
 .route-summary {
   display: grid;
   gap: 8px;
@@ -751,7 +823,7 @@ button:disabled {
 .sticks {
   display: grid;
   gap: 8px;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
 }
 
 .mode-switch {
@@ -909,6 +981,46 @@ progress {
   width: 100%;
 }
 
+.voltage-alarm {
+  align-items: center;
+  background: rgba(127, 29, 29, 0.72);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 20px;
+  position: fixed;
+  z-index: 2000;
+}
+
+.voltage-alarm__panel {
+  background: #ffffff;
+  border: 3px solid #b42318;
+  border-radius: 8px;
+  box-shadow: 0 24px 70px rgba(23, 33, 31, 0.35);
+  display: grid;
+  gap: 12px;
+  max-width: 440px;
+  padding: 22px;
+  text-align: center;
+  width: 100%;
+}
+
+.voltage-alarm__panel strong {
+  color: #b42318;
+  font-size: 28px;
+}
+
+.voltage-alarm__panel span {
+  color: #17211f;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.voltage-alarm__panel p {
+  color: #40514d;
+  margin: 0;
+}
+
 @media (max-width: 900px) {
   .shell {
     height: auto;
@@ -971,7 +1083,7 @@ progress {
   }
 
   .buttons {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
   }
 
   .buttons button,
