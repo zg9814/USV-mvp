@@ -44,6 +44,10 @@ type Waypoint = {
   lng: number;
   order: number;
   waitSeconds: number;
+  captureEnabled?: boolean;
+  capturePointIndex?: number;
+  expectedPhotoCount?: number;
+  captureStepDeg?: number;
 };
 
 type MapPoint = {
@@ -73,6 +77,87 @@ type ReturnHomeState = {
   startedAt: string | null;
   completedAt: string | null;
   lastDistanceMeters: number | null;
+};
+
+type CaptureImage = {
+  id: number;
+  photo_index: number;
+  point_index?: number | null;
+  capture_date?: string | null;
+  angle_deg: number | null;
+  uploaded_at: string;
+  detection?: CaptureDetection | null;
+};
+
+type CaptureDetection = {
+  id: number;
+  image_id: number;
+  status: string;
+  model_path: string | null;
+  device: string | null;
+  inference_ms: number | null;
+  detections_json: string | null;
+  detected_count: number;
+  annotated_path: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type CapturePoint = {
+  plan: {
+    mission_id: string;
+    capture_point_index: number;
+    point_index?: number | null;
+    capture_date?: string | null;
+    device_id?: string;
+    waypoint_seq: number;
+    lat: number;
+    lng: number;
+    wait_seconds: number;
+    expected_photo_count: number;
+    capture_step_deg: number;
+    reupload_attempts: number;
+    status: string;
+  };
+  images: CaptureImage[];
+  received: number;
+  missing: number[];
+  complete: boolean;
+};
+
+type CaptureMission = {
+  missionId: string | null;
+  captureDate?: string | null;
+  deviceId?: string | null;
+  points: CapturePoint[];
+};
+
+type PiClientStatus = {
+  connectedAt: string;
+  registeredAt: string | null;
+  deviceId: string | null;
+  piId: string | null;
+  firmwareVersion: string | null;
+  cameraCount: number | null;
+  lastHeartbeatAt: string | null;
+  lastMessageType: string | null;
+  lastMessageAt: string | null;
+  lastCaptureStatus: unknown;
+  lastReuploadResult: unknown;
+};
+
+type PiStatus = {
+  online: boolean;
+  connectionCount: number;
+  clients: PiClientStatus[];
+  lastOutbound: { type: string; sentAt: string; data: unknown } | null;
+};
+
+type DetectionSettings = {
+  enabled: boolean;
+  modelPath: string;
+  confidence: number;
 };
 
 type EventLogRow = {
@@ -176,6 +261,15 @@ const MISSION_LOOP_MIN = 1;
 const MISSION_LOOP_MAX = 10;
 const WAYPOINT_WAIT_MIN_SECONDS = 0;
 const WAYPOINT_WAIT_MAX_SECONDS = 600;
+const CAPTURE_DEFAULT_WAIT_SECONDS = 60;
+const CAPTURE_DEFAULT_PHOTO_COUNT = 10;
+const CAPTURE_DEFAULT_STEP_DEG = 36;
+const CAPTURE_PHOTO_COUNT_MIN = 1;
+const CAPTURE_PHOTO_COUNT_MAX = 200;
+const CAPTURE_STEP_MIN = 1;
+const CAPTURE_STEP_MAX = 360;
+const CAMERA_TRIGGER_RELAY = 0;
+const CAMERA_TRIGGER_PULSE_SECONDS = 1;
 const LOW_VOLTAGE_ALARM_THRESHOLD = 22;
 const LOW_VOLTAGE_ALARM_SAMPLES = 5;
 const LOW_VOLTAGE_ALARM_SAMPLE_MS = 1000;
@@ -184,6 +278,18 @@ const mission = reactive<MissionState>({
   waypoints: [],
   currentWaypoint: 0,
   totalWaypoints: 0
+});
+const captureMission = reactive<CaptureMission>({
+  missionId: null,
+  captureDate: null,
+  deviceId: null,
+  points: []
+});
+const piStatus = reactive<PiStatus>({
+  online: false,
+  connectionCount: 0,
+  clients: [],
+  lastOutbound: null
 });
 const home = reactive<HomeState>({
   point: null,
@@ -209,16 +315,34 @@ const shipOverlay = reactive({
 });
 const displayShipPoint = ref<MapPoint | null>(null);
 const displayTrack = ref<MapPoint[]>([]);
-const activeView = ref<'console' | 'logs'>('console');
+const activeView = ref<'console' | 'logs' | 'camera'>('console');
 const homePickingEnabled = ref(false);
 const lowVoltageMinimized = ref(false);
 const lowVoltageAlarmActive = ref(false);
+const cameraTriggerLoading = ref(false);
+const cameraTriggerMessage = ref('');
+const cameraTriggerError = ref('');
+const testPlanLoading = ref(false);
+const testPlanMessage = ref('');
+const testPlanError = ref('');
+const commandInput = ref('');
+const commandInputLoading = ref(false);
+const commandInputResult = ref('');
+const commandInputError = ref('');
+const detectionSettings = reactive<DetectionSettings>({
+  enabled: true,
+  modelPath: '',
+  confidence: 0.25
+});
+const detectionSettingsLoading = ref(false);
+const detectionSettingsError = ref('');
 const logFilters = reactive({
   from: toLocalDateInput(new Date(Date.now() - 60 * 60 * 1000)),
   to: toLocalDateInput(new Date()),
   level: '',
   category: '',
-  type: ''
+  type: '',
+  q: ''
 });
 const eventRows = ref<EventLogRow[]>([]);
 const telemetryRows = ref<TelemetrySampleRow[]>([]);
@@ -228,6 +352,7 @@ const logsError = ref('');
 
 let ws: WebSocket | null = null;
 let controlTimer: number | null = null;
+let piStatusTimer: number | null = null;
 let reconnectTimer: number | null = null;
 let mapContainer: HTMLDivElement | null = null;
 let map: any = null;
@@ -268,7 +393,20 @@ const displayLngLabel = computed(() => displayShipPoint.value ? displayShipPoint
 const displayLatLabel = computed(() => displayShipPoint.value ? displayShipPoint.value.lat.toFixed(7) : '--');
 const routeLengthMeters = computed(() => calculateRouteLength(waypoints.value));
 const routeLengthLabel = computed(() => formatDistance(routeLengthMeters.value));
-const missionUploadItemCount = computed(() => waypoints.value.length === 0 ? 0 : waypoints.value.length + 1 + (missionLoopCount.value > 1 ? 1 : 0));
+const captureWaypointCount = computed(() => waypoints.value.filter((point) => point.captureEnabled).length);
+const missionUploadItemCount = computed(() => waypoints.value.length === 0 ? 0 : waypoints.value.length + 1 + captureWaypointCount.value + (missionLoopCount.value > 1 ? 1 : 0));
+const captureMissionLabel = computed(() => {
+  if (captureMission.captureDate) return `date=${captureMission.captureDate}`;
+  return captureMission.missionId ? `mission=${captureMission.missionId}` : '--';
+});
+const captureExpectedTotal = computed(() => captureMission.points.reduce((sum, point) => sum + point.plan.expected_photo_count, 0));
+const captureReceivedTotal = computed(() => captureMission.points.reduce((sum, point) => sum + point.received, 0));
+const captureCompletionLabel = computed(() => `${captureReceivedTotal.value}/${captureExpectedTotal.value || 0}`);
+const cameraTriggerDisabled = computed(() => cameraTriggerLoading.value || !state.online || !state.remoteKnown);
+const primaryPiClient = computed(() => piStatus.clients[0] ?? null);
+const piHeartbeatLabel = computed(() => primaryPiClient.value?.lastHeartbeatAt ? new Date(primaryPiClient.value.lastHeartbeatAt).toLocaleTimeString() : '--');
+const piRegisteredLabel = computed(() => primaryPiClient.value?.registeredAt ? new Date(primaryPiClient.value.registeredAt).toLocaleTimeString() : '--');
+const piLastMessageLabel = computed(() => primaryPiClient.value?.lastMessageType || '--');
 const homeLabel = computed(() => home.point ? `${home.point.lng.toFixed(7)}, ${home.point.lat.toFixed(7)}` : '未设置');
 const homeStatusLabel = computed(() => {
   const labels: Record<HomeState['syncStatus'], string> = {
@@ -326,6 +464,10 @@ onMounted(() => {
   document.addEventListener('mouseup', onDocumentMapPointerUp, true);
   initializeMap();
   loadHome();
+  loadCaptureStatus();
+  loadPiStatus();
+  loadDetectionSettings();
+  piStatusTimer = window.setInterval(loadPiStatus, 3000);
   controlTimer = window.setInterval(() => {
     pruneTrack();
     updateKeyboardControl();
@@ -339,6 +481,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   ws?.close();
   if (controlTimer) window.clearInterval(controlTimer);
+  if (piStatusTimer) window.clearInterval(piStatusTimer);
   if (reconnectTimer) window.clearTimeout(reconnectTimer);
   window.removeEventListener('pointerdown', unlockLowVoltageAlarmAudio);
   window.removeEventListener('keydown', unlockLowVoltageAlarmAudio);
@@ -414,6 +557,7 @@ function connectWs() {
     }
     if (message.type === 'mission.uploaded') {
       mission.status = message.data.success ? 'ready' : 'idle';
+      if (message.data.missionId) loadCaptureStatus(message.data.missionId);
       if (!message.data.success) resetMissionLoopProgress();
       statusText.value = message.data.success ? '航点写入成功' : `航点写入失败：${message.data.result ?? '未收到飞控确认'}`;
     }
@@ -451,6 +595,12 @@ function connectWs() {
     if (message.type === 'return.home') {
       Object.assign(returnHome, message.data);
       if (returnHome.active) statusText.value = '正在返航';
+    }
+    if (message.type === 'capture.updated' || message.type === 'capture.plan') {
+      applyCaptureMission(message.data);
+    }
+    if (message.type === 'detections.settings') {
+      Object.assign(detectionSettings, message.data);
     }
   });
 
@@ -492,6 +642,193 @@ async function loadHome() {
   } catch (error) {
     console.warn(error);
   }
+}
+
+async function loadCaptureStatus(missionId?: string | null) {
+  try {
+    const url = missionId ? `/api/captures?missionId=${encodeURIComponent(missionId)}` : '/api/captures';
+    const response = await fetch(url);
+    const result = await response.json() as { data?: CaptureMission };
+    if (result.data) applyCaptureMission(result.data);
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+async function loadPiStatus() {
+  try {
+    const response = await fetch('/api/pi/status');
+    const result = await response.json() as { data?: PiStatus };
+    if (result.data) {
+      piStatus.online = result.data.online;
+      piStatus.connectionCount = result.data.connectionCount;
+      piStatus.clients = result.data.clients || [];
+      piStatus.lastOutbound = result.data.lastOutbound;
+    }
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+async function loadDetectionSettings() {
+  try {
+    const response = await fetch('/api/detections/settings');
+    const result = await response.json() as { data?: DetectionSettings };
+    if (result.data) Object.assign(detectionSettings, result.data);
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+async function toggleDetectionSettings() {
+  detectionSettingsLoading.value = true;
+  detectionSettingsError.value = '';
+  try {
+    const nextEnabled = !detectionSettings.enabled;
+    const result = await postJson<{ ok: boolean; message?: string; data?: DetectionSettings }>('/api/detections/settings', {
+      enabled: nextEnabled
+    });
+    if (result.data) Object.assign(detectionSettings, result.data);
+    statusText.value = result.message || (nextEnabled ? 'AI 识别过滤已开启' : 'AI 识别过滤已关闭');
+  } catch (error) {
+    detectionSettingsError.value = error instanceof Error ? error.message : '未知错误';
+    statusText.value = `AI 识别设置失败：${detectionSettingsError.value}`;
+  } finally {
+    detectionSettingsLoading.value = false;
+  }
+}
+
+function applyCaptureMission(data: unknown) {
+  const payload = data as Partial<CaptureMission> & { plans?: unknown[] };
+  if ('points' in payload) {
+    captureMission.missionId = payload.missionId ?? null;
+    captureMission.captureDate = payload.captureDate ?? null;
+    captureMission.deviceId = payload.deviceId ?? null;
+    captureMission.points = Array.isArray(payload.points) ? payload.points as CapturePoint[] : [];
+    return;
+  }
+  if ('missionId' in payload && 'plans' in payload) {
+    captureMission.missionId = payload.missionId ?? null;
+    captureMission.captureDate = null;
+    captureMission.deviceId = null;
+    captureMission.points = [];
+  }
+}
+
+async function triggerCameraCapture() {
+  cameraTriggerLoading.value = true;
+  cameraTriggerMessage.value = '';
+  cameraTriggerError.value = '';
+  try {
+    const result = await postJson<{ ok: boolean; message?: string; data?: { relay: number; pulseSeconds: number } }>('/api/camera/trigger', {
+      relay: CAMERA_TRIGGER_RELAY,
+      pulseSeconds: CAMERA_TRIGGER_PULSE_SECONDS
+    });
+    cameraTriggerMessage.value = result.message || '高电平触发已发送';
+    statusText.value = cameraTriggerMessage.value;
+  } catch (error) {
+    cameraTriggerError.value = error instanceof Error ? error.message : '未知错误';
+    statusText.value = `触发拍摄失败：${cameraTriggerError.value}`;
+  } finally {
+    cameraTriggerLoading.value = false;
+  }
+}
+
+async function sendCommandInput() {
+  const command = commandInput.value.trim();
+  if (!command) return;
+  commandInputLoading.value = true;
+  commandInputResult.value = '';
+  commandInputError.value = '';
+  try {
+    const result = await postJson<{ ok: boolean; message?: string; data?: unknown }>('/api/command-line', { command });
+    commandInputResult.value = result.message || '指令已发送';
+    statusText.value = commandInputResult.value;
+  } catch (error) {
+    commandInputError.value = error instanceof Error ? error.message : '未知错误';
+    statusText.value = `指令发送失败：${commandInputError.value}`;
+  } finally {
+    commandInputLoading.value = false;
+  }
+}
+
+async function createTestCapturePlan() {
+  testPlanLoading.value = true;
+  testPlanMessage.value = '';
+  testPlanError.value = '';
+  try {
+    const result = await postJson<{ code: number; message?: string; data?: CaptureMission }>('/api/capture-plan/test', {
+      deviceId: state.deviceId,
+      expectedPhotoCount: CAPTURE_DEFAULT_PHOTO_COUNT,
+      captureStepDeg: CAPTURE_DEFAULT_STEP_DEG,
+      waitSeconds: CAPTURE_DEFAULT_WAIT_SECONDS
+    });
+    if (result.data) applyCaptureMission(result.data);
+    testPlanMessage.value = `${result.message || '测试拍摄计划已创建'}：${captureMissionLabel.value}`;
+    statusText.value = testPlanMessage.value;
+  } catch (error) {
+    testPlanError.value = error instanceof Error ? error.message : '未知错误';
+    statusText.value = `创建测试计划失败：${testPlanError.value}`;
+  } finally {
+    testPlanLoading.value = false;
+  }
+}
+
+function capturePhotoCells(point: CapturePoint) {
+  const uploaded = new Map(point.images.map((image) => [image.photo_index, image]));
+  return Array.from({ length: point.plan.expected_photo_count }, (_, index) => {
+    const photoIndex = index + 1;
+    return {
+      photoIndex,
+      image: uploaded.get(photoIndex) ?? null
+    };
+  });
+}
+
+function detectionLabel(image: CaptureImage | null) {
+  if (!image) return '';
+  const detection = image.detection;
+  if (!detection || detection.status === 'skipped') return '未启用识别';
+  if (detection.status === 'pending') return '待识别';
+  if (detection.status === 'running') return '识别中';
+  if (detection.status === 'failed') return '识别失败';
+  if (detection.status === 'complete') return detection.detected_count > 0 ? `排口 ${detection.detected_count}` : '无排口';
+  return detection.status;
+}
+
+function detectionClass(image: CaptureImage | null) {
+  const status = image?.detection?.status;
+  if (!status || status === 'skipped') return 'skipped';
+  if (status === 'complete' && (image?.detection?.detected_count ?? 0) > 0) return 'detected';
+  if (status === 'failed') return 'failed';
+  return status;
+}
+
+function capturePointIndexLabel(point: CapturePoint): number {
+  return point.plan.point_index ?? point.plan.capture_point_index;
+}
+
+function capturePointDateLabel(point: CapturePoint): string {
+  return point.plan.capture_date || captureMission.captureDate || '--';
+}
+
+function capturePointKey(point: CapturePoint): string {
+  return `${point.plan.device_id || captureMission.deviceId || 'device'}-${capturePointDateLabel(point)}-${capturePointIndexLabel(point)}`;
+}
+
+function capturePointTitle(point: CapturePoint): string {
+  return `date=${capturePointDateLabel(point)} point=${capturePointIndexLabel(point)}`;
+}
+
+function openCaptureLogs() {
+  logFilters.from = toLocalDateInput(new Date(Date.now() - 60 * 60 * 1000));
+  logFilters.to = toLocalDateInput(new Date());
+  logFilters.level = '';
+  logFilters.category = 'capture';
+  logFilters.type = '';
+  logFilters.q = '';
+  activeView.value = 'logs';
+  loadLogs();
 }
 
 async function setHome(point: { lat: number; lng: number; altitude?: number | null }) {
@@ -646,6 +983,7 @@ function logQueryParams() {
   if (logFilters.level) params.set('level', logFilters.level);
   if (logFilters.category) params.set('category', logFilters.category);
   if (logFilters.type) params.set('type', logFilters.type);
+  if (logFilters.q) params.set('q', logFilters.q);
   return params.toString();
 }
 
@@ -662,10 +1000,14 @@ function exportLogs(kind: 'events' | 'telemetry') {
   window.location.href = `/api/logs/export.csv?kind=${kind}&${query}`;
 }
 
-function switchView(view: 'console' | 'logs') {
+function switchView(view: 'console' | 'logs' | 'camera') {
   activeView.value = view;
   if (view === 'logs' && eventRows.value.length === 0 && telemetryRows.value.length === 0) {
     loadLogs();
+  }
+  if (view === 'camera') {
+    loadCaptureStatus(captureMission.missionId);
+    loadPiStatus();
   }
 }
 
@@ -1211,7 +1553,10 @@ function addWaypoint(lnglat: any) {
       lng: lnglat.lng ?? lnglat.getLng(),
       lat: lnglat.lat ?? lnglat.getLat(),
       order: waypoints.value.length + 1,
-      waitSeconds: 0
+      waitSeconds: 0,
+      captureEnabled: false,
+      expectedPhotoCount: CAPTURE_DEFAULT_PHOTO_COUNT,
+      captureStepDeg: CAPTURE_DEFAULT_STEP_DEG
     }
   ];
 }
@@ -1310,6 +1655,35 @@ function setWaypointWait(point: Waypoint, event: Event) {
   waypoints.value = waypoints.value.map((item) => (
     item.order === point.order ? { ...item, waitSeconds } : item
   ));
+}
+
+function setWaypointCapture(point: Waypoint, event: Event) {
+  const enabled = (event.target as HTMLInputElement).checked;
+  waypoints.value = waypoints.value.map((item) => (
+    item.order === point.order
+      ? {
+          ...item,
+          captureEnabled: enabled,
+          waitSeconds: enabled && item.waitSeconds === 0 ? CAPTURE_DEFAULT_WAIT_SECONDS : item.waitSeconds,
+          expectedPhotoCount: item.expectedPhotoCount ?? CAPTURE_DEFAULT_PHOTO_COUNT,
+          captureStepDeg: item.captureStepDeg ?? CAPTURE_DEFAULT_STEP_DEG
+        }
+      : item
+  ));
+}
+
+function setWaypointExpectedPhotos(point: Waypoint, event: Event) {
+  const input = event.target as HTMLInputElement;
+  const value = Math.round(Number(input.value));
+  const expectedPhotoCount = clamp(Number.isFinite(value) ? value : CAPTURE_DEFAULT_PHOTO_COUNT, CAPTURE_PHOTO_COUNT_MIN, CAPTURE_PHOTO_COUNT_MAX);
+  waypoints.value = waypoints.value.map((item) => item.order === point.order ? { ...item, expectedPhotoCount } : item);
+}
+
+function setWaypointCaptureStep(point: Waypoint, event: Event) {
+  const input = event.target as HTMLInputElement;
+  const value = Math.round(Number(input.value));
+  const captureStepDeg = clamp(Number.isFinite(value) ? value : CAPTURE_DEFAULT_STEP_DEG, CAPTURE_STEP_MIN, CAPTURE_STEP_MAX);
+  waypoints.value = waypoints.value.map((item) => item.order === point.order ? { ...item, captureStepDeg } : item);
 }
 
 function calculateRouteLength(points: Waypoint[]) {
@@ -1464,6 +1838,7 @@ function bindMapMoveEvents() {
       <div class="status-pills">
         <button class="view-tab" :class="{ active: activeView === 'console' }" @click="switchView('console')">控制台</button>
         <button class="view-tab" :class="{ active: activeView === 'logs' }" @click="switchView('logs')">事件日志</button>
+        <button class="view-tab" :class="{ active: activeView === 'camera' }" @click="switchView('camera')">摄像头测试</button>
         <span class="pill" :class="{ ok: wsConnected }">WS {{ wsConnected ? '连接' : '断开' }}</span>
         <span class="pill" :class="{ ok: state.online }">船端 {{ state.online ? '在线' : '离线' }}</span>
         <span class="pill" :class="{ ok: state.remoteKnown }">UDP {{ state.udpPort }}</span>
@@ -1666,6 +2041,36 @@ function bindMapMoveEvents() {
                   <span>秒</span>
                 </label>
               </div>
+              <div class="waypoint-capture">
+                <label>
+                  <input
+                    type="checkbox"
+                    :checked="point.captureEnabled"
+                    @change="setWaypointCapture(point, $event)"
+                  />
+                  <span>拍照点</span>
+                </label>
+                <label v-if="point.captureEnabled">
+                  <span>张数</span>
+                  <input
+                    type="number"
+                    :min="CAPTURE_PHOTO_COUNT_MIN"
+                    :max="CAPTURE_PHOTO_COUNT_MAX"
+                    :value="point.expectedPhotoCount ?? CAPTURE_DEFAULT_PHOTO_COUNT"
+                    @input="setWaypointExpectedPhotos(point, $event)"
+                  />
+                </label>
+                <label v-if="point.captureEnabled">
+                  <span>角度</span>
+                  <input
+                    type="number"
+                    :min="CAPTURE_STEP_MIN"
+                    :max="CAPTURE_STEP_MAX"
+                    :value="point.captureStepDeg ?? CAPTURE_DEFAULT_STEP_DEG"
+                    @input="setWaypointCaptureStep(point, $event)"
+                  />
+                </label>
+              </div>
             </li>
           </ol>
           <p v-else>在地图上点击添加航点</p>
@@ -1695,6 +2100,35 @@ function bindMapMoveEvents() {
               <button v-if="mission.status !== 'idle'" @click="clearMission" class="danger">
                 清除任务
               </button>
+            </div>
+          </div>
+
+          <div class="capture-records">
+            <div class="capture-records__head">
+              <span>拍摄记录</span>
+              <strong>{{ captureMissionLabel }}</strong>
+              <button @click="loadCaptureStatus(captureMission.missionId)">刷新</button>
+            </div>
+            <div v-if="captureMission.points.length === 0" class="capture-empty">暂无拍摄计划</div>
+            <div v-else class="capture-point" v-for="point in captureMission.points" :key="capturePointKey(point)">
+              <div>
+                <b>{{ capturePointTitle(point) }}</b>
+                <span>{{ point.received }}/{{ point.plan.expected_photo_count }}</span>
+                <em :class="{ complete: point.complete }">{{ point.complete ? 'complete' : point.plan.status }}</em>
+              </div>
+              <p v-if="point.missing.length > 0">缺失：{{ point.missing.join(', ') }}</p>
+              <p v-else>照片完整</p>
+              <div class="capture-images" v-if="point.images.length > 0">
+                <a
+                  v-for="image in point.images"
+                  :key="image.id"
+                  :href="`/api/captures/${image.id}/original`"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  #{{ image.photo_index }}
+                </a>
+              </div>
             </div>
           </div>
         </div>
@@ -1734,8 +2168,180 @@ function bindMapMoveEvents() {
             <label>油门 <progress max="2" :value="throttle + 1"></progress></label>
             <label>转向 <progress max="2" :value="steering + 1"></progress></label>
           </div>
+
+          <div class="command-console">
+            <div>
+              <span>指令输入</span>
+              <small>arm / mode hold / manual 0.2 0 / relay 0 1 / mavcmd ...</small>
+            </div>
+            <form @submit.prevent="sendCommandInput">
+              <input
+                v-model.trim="commandInput"
+                type="text"
+                placeholder="输入要发送给船或飞控的指令"
+                autocomplete="off"
+              />
+              <button type="submit" :disabled="commandInputLoading || !commandInput.trim()">
+                {{ commandInputLoading ? '发送中' : '发送' }}
+              </button>
+            </form>
+            <p v-if="commandInputResult" class="command-console__ok">{{ commandInputResult }}</p>
+            <p v-if="commandInputError" class="command-console__error">{{ commandInputError }}</p>
+          </div>
         </div>
       </aside>
+    </section>
+
+    <section v-else-if="activeView === 'camera'" class="camera-page">
+      <div class="panel camera-hero">
+        <div>
+          <p class="eyebrow">Camera Test</p>
+          <h2>树莓派摄像头联调</h2>
+          <p>船控输出高电平后，树莓派内部完成电机旋转一圈和 10 张拍摄；云端只负责触发、接收和验收。</p>
+        </div>
+        <div class="camera-summary">
+          <span>{{ captureMissionLabel }}</span>
+          <strong>{{ captureCompletionLabel }}</strong>
+          <em>{{ piStatus.online ? '树莓派在线' : '树莓派离线' }} · {{ state.online ? '船端在线' : '船端离线' }}</em>
+        </div>
+      </div>
+
+      <div class="camera-grid">
+        <div class="panel camera-card">
+          <div class="camera-card__title">
+            <strong>树莓派连接</strong>
+            <span>{{ piStatus.connectionCount }} 个连接</span>
+          </div>
+          <dl class="camera-endpoints">
+            <div>
+              <dt>状态</dt>
+              <dd>{{ piStatus.online ? '在线' : '离线' }}</dd>
+            </div>
+            <div>
+              <dt>Pi ID</dt>
+              <dd>{{ primaryPiClient?.piId || '--' }}</dd>
+            </div>
+            <div>
+              <dt>Device ID</dt>
+              <dd>{{ primaryPiClient?.deviceId || '--' }}</dd>
+            </div>
+            <div>
+              <dt>注册时间</dt>
+              <dd>{{ piRegisteredLabel }}</dd>
+            </div>
+            <div>
+              <dt>最近心跳</dt>
+              <dd>{{ piHeartbeatLabel }}</dd>
+            </div>
+            <div>
+              <dt>最近消息</dt>
+              <dd>{{ piLastMessageLabel }}</dd>
+            </div>
+            <div>
+              <dt>最近下发</dt>
+              <dd>{{ piStatus.lastOutbound?.type || '--' }}</dd>
+            </div>
+          </dl>
+          <button @click="loadPiStatus">刷新连接状态</button>
+        </div>
+
+        <div class="panel camera-card">
+          <div class="camera-card__title">
+            <strong>船控高电平触发测试</strong>
+            <span>Relay {{ CAMERA_TRIGGER_RELAY }} / {{ CAMERA_TRIGGER_PULSE_SECONDS }} 秒</span>
+          </div>
+          <p>点击后云端向飞控发送 relay 高电平，再自动拉低，用于单独测试树莓派拍摄流程。</p>
+          <button class="camera-trigger" :disabled="cameraTriggerDisabled" @click="triggerCameraCapture">
+            {{ cameraTriggerLoading ? '发送中' : '触发拍摄' }}
+          </button>
+          <p v-if="!state.online || !state.remoteKnown" class="camera-warning">船端离线或 UDP remote 未知，无法向船控发送高电平指令。</p>
+          <p v-if="cameraTriggerMessage" class="camera-ok">{{ cameraTriggerMessage }}</p>
+          <p v-if="cameraTriggerError" class="camera-warning">{{ cameraTriggerError }}</p>
+        </div>
+
+        <div class="panel camera-card">
+          <div class="camera-card__title">
+            <strong>树莓派接口</strong>
+            <button @click="loadCaptureStatus(captureMission.missionId)">刷新</button>
+          </div>
+          <dl class="camera-endpoints">
+            <div>
+              <dt>WebSocket</dt>
+              <dd>ws://121.40.86.143:4100/api/pi/ws</dd>
+            </div>
+            <div>
+              <dt>上传</dt>
+              <dd>http://121.40.86.143:4100/api/captures/upload</dd>
+            </div>
+            <div>
+              <dt>计划</dt>
+              <dd>/api/capture-plan/current?deviceId={{ state.deviceId }}</dd>
+            </div>
+          </dl>
+          <div class="ai-detection-toggle">
+            <div>
+              <strong>AI 识别过滤</strong>
+              <span>{{ detectionSettings.enabled ? '上传后自动识别排口' : '仅保存原图' }}</span>
+            </div>
+            <button
+              type="button"
+              :class="{ active: detectionSettings.enabled }"
+              :disabled="detectionSettingsLoading"
+              @click="toggleDetectionSettings"
+            >
+              {{ detectionSettings.enabled ? '开' : '关' }}
+            </button>
+          </div>
+          <p v-if="detectionSettingsError" class="camera-warning">{{ detectionSettingsError }}</p>
+          <button :disabled="testPlanLoading" @click="createTestCapturePlan">
+            {{ testPlanLoading ? '创建中' : '创建测试拍摄计划' }}
+          </button>
+          <p v-if="testPlanMessage" class="camera-ok">{{ testPlanMessage }}</p>
+          <p v-if="testPlanError" class="camera-warning">{{ testPlanError }}</p>
+          <button @click="openCaptureLogs">查看 capture 事件日志</button>
+        </div>
+      </div>
+
+      <div class="panel camera-card">
+        <div class="camera-card__title">
+          <strong>拍摄计划与上传验收</strong>
+          <span>{{ captureMission.points.length }} 个拍照点</span>
+        </div>
+        <div v-if="captureMission.points.length === 0" class="capture-empty">暂无拍摄计划。可创建测试拍摄计划，或上传包含拍照点的航线。</div>
+        <div v-else class="camera-points">
+          <div class="camera-point" v-for="point in captureMission.points" :key="capturePointKey(point)">
+            <div class="camera-point__head">
+              <div>
+                <b>{{ capturePointTitle(point) }}</b>
+                <span>等待 {{ point.plan.wait_seconds }} 秒 · {{ point.plan.lng.toFixed(7) }}, {{ point.plan.lat.toFixed(7) }}</span>
+              </div>
+              <em :class="{ complete: point.complete }">{{ point.complete ? 'complete' : point.plan.status }}</em>
+            </div>
+            <div class="camera-photo-grid">
+              <div
+                v-for="cell in capturePhotoCells(point)"
+                :key="cell.photoIndex"
+                class="camera-photo-cell"
+                :class="{ received: cell.image }"
+              >
+                <span>photo={{ cell.photoIndex }}</span>
+                <em v-if="cell.image" :class="detectionClass(cell.image)">{{ detectionLabel(cell.image) }}</em>
+                <small v-if="cell.image" class="camera-photo-links">
+                  <a :href="`/api/captures/${cell.image.id}/original`" target="_blank" rel="noreferrer">原图</a>
+                  <a
+                    v-if="cell.image.detection?.status === 'complete' && cell.image.detection.annotated_path"
+                    :href="`/api/captures/${cell.image.id}/annotated`"
+                    target="_blank"
+                    rel="noreferrer"
+                  >结果</a>
+                </small>
+              </div>
+            </div>
+            <p v-if="point.missing.length > 0">缺失：{{ point.missing.join(', ') }}；补传次数 {{ point.plan.reupload_attempts }}</p>
+            <p v-else>照片完整；已收到 {{ point.received }}/{{ point.plan.expected_photo_count }}</p>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section v-else class="logs-page">
@@ -1774,6 +2380,15 @@ function bindMapMoveEvents() {
         <label>
           <span>类型</span>
           <input v-model.trim="logFilters.type" placeholder="control_tx" />
+        </label>
+        <label class="logs-search">
+          <span>关键词</span>
+          <input
+            v-model.trim="logFilters.q"
+            type="search"
+            placeholder="搜索消息 / details / raw hex"
+            @keydown.enter.prevent="loadLogs"
+          />
         </label>
         <button @click="loadLogs" :disabled="logsLoading">{{ logsLoading ? '加载中' : '刷新' }}</button>
         <button @click="exportLogs('events')">导出事件</button>

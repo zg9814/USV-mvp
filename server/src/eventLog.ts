@@ -52,6 +52,7 @@ export type EventLogQuery = {
   level?: string | null;
   category?: string | null;
   type?: string | null;
+  q?: string | null;
   limit?: number | null;
   cursor?: number | null;
 };
@@ -223,6 +224,18 @@ export class EventLogStore {
       clauses.push('type = @type');
       values.type = params.type;
     }
+    if (params.q) {
+      clauses.push(`(
+        message LIKE @q ESCAPE '\\' OR category LIKE @q ESCAPE '\\'
+        OR type LIKE @q ESCAPE '\\' OR level LIKE @q ESCAPE '\\'
+        OR COALESCE(device_id, '') LIKE @q ESCAPE '\\'
+        OR COALESCE(remote_address, '') LIKE @q ESCAPE '\\'
+        OR COALESCE(result, '') LIKE @q ESCAPE '\\'
+        OR COALESCE(details_json, '') LIKE @q ESCAPE '\\'
+        OR COALESCE(raw_hex, '') LIKE @q ESCAPE '\\'
+      )`);
+      values.q = `%${escapeLike(params.q)}%`;
+    }
     if (params.cursor) {
       clauses.push('id < @cursor');
       values.cursor = params.cursor;
@@ -365,6 +378,7 @@ function normalizeQuery(query: EventLogQuery) {
     level: blankToNull(query.level),
     category: blankToNull(query.category),
     type: blankToNull(query.type),
+    q: blankToNull(query.q),
     limit: clampLimit(query.limit),
     cursor: positiveIntOrNull(query.cursor)
   };
@@ -408,6 +422,10 @@ function positiveIntOrNull(value: number | null | undefined): number | null {
 function blankToNull(value: string | null | undefined): string | null {
   const trimmed = String(value ?? '').trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
 function boolToInt(value: boolean | null | undefined): number | null {

@@ -44,6 +44,10 @@ export type Waypoint = {
   lng: number;
   order: number;
   waitSeconds?: number;
+  captureEnabled?: boolean;
+  capturePointIndex?: number;
+  expectedPhotoCount?: number;
+  captureStepDeg?: number;
 };
 
 export type MissionItem =
@@ -53,6 +57,13 @@ export type MissionItem =
       order: number;
       target: number;
       repeat: number;
+    }
+  | {
+      type: 'aux';
+      order: number;
+      capturePointIndex: number;
+      relay: number;
+      pulseSeconds: number;
     };
 
 export type MissionState = {

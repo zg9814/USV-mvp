@@ -71,6 +71,47 @@ export type CommandAck = {
   resultName: string;
 };
 
+export type ParsedGpsRaw = {
+  gpsFixType: number;
+  gpsFixLabel: string;
+  gpsSatellites: number | null;
+  gpsHdop: number | null;
+  gpsVdop: number | null;
+  gpsHorizontalAccuracy: number | null;
+  gpsAltitude: number | null;
+};
+
+export type ParsedGps2Raw = ParsedGpsRaw & {
+  gps2Lat: number | null;
+  gps2Lng: number | null;
+  gps2DgpsAgeMs: number | null;
+  gps2DgpsChannels: number | null;
+};
+
+export type ParsedGpsRtk = {
+  receiverId: number;
+  health: number;
+  rateHz: number;
+  satellites: number;
+  baselineCoordsType: number;
+  baselineAMm: number;
+  baselineBMm: number;
+  baselineCMm: number;
+  baselineLengthMm: number;
+  accuracyMm: number;
+  iarHypotheses: number;
+  lastBaselineMs: number;
+  gpsWeek: number;
+  gpsTowMs: number;
+};
+
+export type ParsedCorrectionData = {
+  length: number;
+  flags?: number;
+  targetSystem?: number;
+  targetComponent?: number;
+};
+
 export function decodeFrames(input: Buffer): MavlinkFrame[] {
   const frames: MavlinkFrame[] = [];
   let offset = 0;
@@ -186,6 +227,10 @@ export function buildSetHome(targetSystem: number, targetComponent: number, lat:
   return buildCommandLong(targetSystem, targetComponent, 179, [0, 0, 0, 0, lat, lng, altitude]);
 }
 
+export function buildSetRelay(targetSystem: number, targetComponent: number, relay: number, enabled: boolean): Buffer {
+  return buildCommandLong(targetSystem, targetComponent, 181, [relay, enabled ? 1 : 0, 0, 0, 0, 0, 0]);
+}
+
 export function buildEmergencyStop(targetSystem: number, targetComponent: number): Buffer[] {
   return [
     buildManualControl(targetSystem, { throttle: 0, steering: 0 }),
@@ -244,7 +289,7 @@ export function parseSysStatus(payload: Buffer) {
   };
 }
 
-export function parseGpsRawInt(payload: Buffer) {
+export function parseGpsRawInt(payload: Buffer): ParsedGpsRaw | null {
   if (payload.length < 30) return null;
   const fixType = payload.readUInt8(28);
   const satellites = payload.readUInt8(29);
@@ -261,6 +306,73 @@ export function parseGpsRawInt(payload: Buffer) {
     gpsVdop: vdopRaw === 65535 ? null : vdopRaw / 100,
     gpsHorizontalAccuracy: hAccRaw > 0 && hAccRaw !== 0xffffffff ? hAccRaw / 1000 : null,
     gpsAltitude: altRaw === 0x7fffffff ? null : altRaw / 1000
+  };
+}
+
+export function parseGps2Raw(payload: Buffer): ParsedGps2Raw | null {
+  if (payload.length < 35) return null;
+  const latRaw = payload.readInt32LE(8);
+  const lngRaw = payload.readInt32LE(12);
+  const altRaw = payload.readInt32LE(16);
+  const dgpsAgeRaw = payload.readUInt32LE(20);
+  const fixType = payload.readUInt8(32);
+  const satellites = payload.readUInt8(33);
+  const dgpsChannels = payload.readUInt8(34);
+  const hdopRaw = payload.readUInt16LE(24);
+  const vdopRaw = payload.readUInt16LE(26);
+
+  return {
+    gpsFixType: fixType,
+    gpsFixLabel: gpsFixTypeLabel(fixType),
+    gpsSatellites: satellites === 255 ? null : satellites,
+    gpsHdop: hdopRaw === 65535 ? null : hdopRaw / 100,
+    gpsVdop: vdopRaw === 65535 ? null : vdopRaw / 100,
+    gpsHorizontalAccuracy: null,
+    gpsAltitude: altRaw === 0x7fffffff ? null : altRaw / 1000,
+    gps2Lat: latRaw === 0 ? null : latRaw / 1e7,
+    gps2Lng: lngRaw === 0 ? null : lngRaw / 1e7,
+    gps2DgpsAgeMs: dgpsAgeRaw === 0xffffffff ? null : dgpsAgeRaw,
+    gps2DgpsChannels: dgpsChannels === 255 ? null : dgpsChannels
+  };
+}
+
+export function parseGpsRtk(payload: Buffer): ParsedGpsRtk | null {
+  if (payload.length < 35) return null;
+  const baselineAMm = payload.readInt32LE(8);
+  const baselineBMm = payload.readInt32LE(12);
+  const baselineCMm = payload.readInt32LE(16);
+  return {
+    lastBaselineMs: payload.readUInt32LE(0),
+    gpsTowMs: payload.readUInt32LE(4),
+    baselineAMm,
+    baselineBMm,
+    baselineCMm,
+    baselineLengthMm: Math.round(Math.sqrt(baselineAMm ** 2 + baselineBMm ** 2 + baselineCMm ** 2)),
+    accuracyMm: payload.readUInt32LE(20),
+    iarHypotheses: payload.readInt32LE(24),
+    gpsWeek: payload.readUInt16LE(28),
+    receiverId: payload.readUInt8(30),
+    health: payload.readUInt8(31),
+    rateHz: payload.readUInt8(32),
+    satellites: payload.readUInt8(33),
+    baselineCoordsType: payload.readUInt8(34)
+  };
+}
+
+export function parseRtcmData(payload: Buffer): ParsedCorrectionData | null {
+  if (payload.length < 2) return null;
+  return {
+    flags: payload.readUInt8(0),
+    length: payload.readUInt8(1)
+  };
+}
+
+export function parseGpsInjectData(payload: Buffer): ParsedCorrectionData | null {
+  if (payload.length < 3) return null;
+  return {
+    targetSystem: payload.readUInt8(0),
+    targetComponent: payload.readUInt8(1),
+    length: payload.readUInt8(2)
   };
 }
 
@@ -345,6 +457,10 @@ export function parseCommandAck(payload: Buffer): CommandAck | null {
     result,
     resultName: commandResultName(result)
   };
+}
+
+export function buildCommandLongGeneric(targetSystem: number, targetComponent: number, command: number, params: number[]): Buffer {
+  return buildCommandLong(targetSystem, targetComponent, command, params);
 }
 
 function buildCommandLong(targetSystem: number, targetComponent: number, command: number, params: number[]): Buffer {
@@ -639,6 +755,34 @@ export function buildMissionDoJumpInt(
   payload.writeFloatLE(0, 24);
   payload.writeUInt16LE(sequence, 28);
   payload.writeUInt16LE(MAV_CMD_DO_JUMP, 30);
+  payload.writeUInt8(targetSystem, 32);
+  payload.writeUInt8(targetComponent, 33);
+  payload.writeUInt8(MAV_FRAME_MISSION, 34);
+  payload.writeUInt8(0, 35);
+  payload.writeUInt8(1, 36);
+  payload.writeUInt8(MAV_MISSION_TYPE_MISSION, 37);
+  return buildFrame(73, payload);
+}
+
+export function buildMissionCommandInt(
+  targetSystem: number,
+  targetComponent: number,
+  sequence: number,
+  command: number,
+  params: number[] = []
+): Buffer {
+  const MAV_FRAME_MISSION = 2;
+  const MAV_MISSION_TYPE_MISSION = 0;
+  const payload = Buffer.alloc(38);
+  payload.writeFloatLE(params[0] ?? 0, 0);
+  payload.writeFloatLE(params[1] ?? 0, 4);
+  payload.writeFloatLE(params[2] ?? 0, 8);
+  payload.writeFloatLE(params[3] ?? 0, 12);
+  payload.writeInt32LE(0, 16);
+  payload.writeInt32LE(0, 20);
+  payload.writeFloatLE(params[6] ?? 0, 24);
+  payload.writeUInt16LE(sequence, 28);
+  payload.writeUInt16LE(command, 30);
   payload.writeUInt8(targetSystem, 32);
   payload.writeUInt8(targetComponent, 33);
   payload.writeUInt8(MAV_FRAME_MISSION, 34);

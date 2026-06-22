@@ -1,17 +1,22 @@
 import dgram from 'node:dgram';
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { access, readFile, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
   buildArmDisarm,
+  buildCommandLongGeneric,
   buildEmergencyStop,
   buildManualControl,
   buildRcChannelsOverride,
   buildRebootAutopilot,
   buildSetHome,
+  buildSetRelay,
   buildSetMode,
   buildMissionCount,
+  buildMissionCommandInt,
   buildMissionItemInt,
   buildMissionDoJumpInt,
   buildMissionClearAll,
@@ -23,9 +28,13 @@ import {
   parseBatteryStatus,
   parseCommandAck,
   parseGlobalPositionInt,
+  parseGps2Raw,
+  parseGpsInjectData,
   parseGpsRawInt,
+  parseGpsRtk,
   parseGpsStatus,
   parseHeartbeat,
+  parseRtcmData,
   parseStatusText,
   parseSysStatus,
   parseVfrHud,
@@ -37,8 +46,9 @@ import {
   parseMissionCurrent,
   parseMissionItemReached
 } from './mavlink.js';
-import type { MavlinkFrame, ParsedMissionItem } from './mavlink.js';
+import type { MavlinkFrame, ParsedCorrectionData, ParsedGps2Raw, ParsedGpsRtk, ParsedMissionItem } from './mavlink.js';
 import { EventLogStore } from './eventLog.js';
+import { CaptureStore, type CapturePointStatus, type CapturePlanInput } from './captureStore.js';
 import { UsvStore } from './state.js';
 import type { ManualControlInput, UsvState, Waypoint, MissionItem } from './types.js';
 
@@ -58,20 +68,54 @@ const RETURN_HOME_RESET_VOLTAGE = Number(process.env.RETURN_HOME_RESET_VOLTAGE ?
 const RETURN_HOME_ARRIVAL_RADIUS_M = Number(process.env.RETURN_HOME_ARRIVAL_RADIUS_M ?? 5);
 const WAYPOINT_WAIT_MIN_SECONDS = 0;
 const WAYPOINT_WAIT_MAX_SECONDS = 600;
+const CAPTURE_DEFAULT_WAIT_SECONDS = Number(process.env.CAPTURE_DEFAULT_WAIT_SECONDS ?? 60);
+const CAPTURE_DEFAULT_PHOTO_COUNT = Number(process.env.CAPTURE_DEFAULT_PHOTO_COUNT ?? 10);
+const CAPTURE_DEFAULT_STEP_DEG = Number(process.env.CAPTURE_DEFAULT_STEP_DEG ?? 36);
+const CAPTURE_AUX_RELAY = Number(process.env.CAPTURE_AUX_RELAY ?? 0);
+const CAPTURE_AUX_PULSE_SECONDS = Number(process.env.CAPTURE_AUX_PULSE_SECONDS ?? 1);
+const CAPTURE_UPLOAD_CHECK_DELAY_SECONDS = Number(process.env.CAPTURE_UPLOAD_CHECK_DELAY_SECONDS ?? 180);
+const CAPTURE_REUPLOAD_MAX_ATTEMPTS = Number(process.env.CAPTURE_REUPLOAD_MAX_ATTEMPTS ?? 3);
+const CAMERA_TRIGGER_COOLDOWN_MS = Number(process.env.CAMERA_TRIGGER_COOLDOWN_MS ?? 5000);
 const LOG_RAW_MAVLINK = process.env.LOG_RAW_MAVLINK === '1';
 const EVENT_DB_PATH = process.env.EVENT_DB_PATH ?? 'data/usv-events.sqlite';
 const EVENT_LOG_RETENTION_DAYS = Number(process.env.EVENT_LOG_RETENTION_DAYS ?? 30);
+const OUTFALL_MODEL_PATH = process.env.OUTFALL_MODEL_PATH ?? 'models/outfall_yolov8s.pt';
+const OUTFALL_CONFIDENCE = Number(process.env.OUTFALL_CONFIDENCE ?? 0.25);
+let aiDetectionEnabled = process.env.OUTFALL_DETECTION_ENABLED !== 'false';
+const OUTFALL_DETECTION_PYTHON = process.env.OUTFALL_DETECTION_PYTHON ?? 'python3';
+const OUTFALL_DETECTION_SCRIPT = process.env.OUTFALL_DETECTION_SCRIPT ?? 'server/scripts/outfall_detect.py';
 
 const store = new UsvStore(OFFLINE_AFTER_MS);
 const eventLog = new EventLogStore(EVENT_DB_PATH, EVENT_LOG_RETENTION_DAYS);
+const captureStore = new CaptureStore(EVENT_DB_PATH);
 const udp = dgram.createSocket('udp4');
 const clients = new Set<WebSocket>();
+
+type PiClientState = {
+  connectedAt: string;
+  registeredAt: string | null;
+  deviceId: string | null;
+  piId: string | null;
+  firmwareVersion: string | null;
+  cameraCount: number | null;
+  lastHeartbeatAt: string | null;
+  lastMessageType: string | null;
+  lastMessageAt: string | null;
+  lastCaptureStatus: unknown;
+  lastReuploadResult: unknown;
+};
+
+const piClients = new Map<WebSocket, PiClientState>();
+let lastPiOutbound: { type: string; sentAt: string; data: unknown } | null = null;
 
 let lastManualInputAt = 0;
 let lastSentZeroAt = 0;
 let missionUploadInProgress = false;
 let pendingMissionItems: MissionItem[] = [];
 let lastUploadMissionItems: MissionItem[] = [];
+let pendingCapturePlan: CapturePlanInput[] = [];
+let pendingCaptureMissionId: string | null = null;
+let currentCaptureMissionId: string | null = null;
 let missionUploadStartTimer: NodeJS.Timeout | null = null;
 let missionUploadTimer: NodeJS.Timeout | null = null;
 const MISSION_UPLOAD_TIMEOUT_MS = 10_000;
@@ -93,6 +137,16 @@ let lastManualControlLogAt = 0;
 let pendingRebootAfterDisarmTimer: NodeJS.Timeout | null = null;
 let lastTelemetrySampleAt = 0;
 let lastOnlineLogged: boolean | null = null;
+let lastCameraTriggerAt = 0;
+let detectionWorkerRunning = false;
+let lastGpsLogSnapshot: GpsLogSnapshot | null = null;
+let lastGpsQualityLogAt = 0;
+let lastGpsDegradedDiagnosticAt = 0;
+let lastGps2LogSnapshot: GpsLogSnapshot | null = null;
+let lastRtkByMessage = new Map<number, RtkDiagnosticSnapshot>();
+let lastCorrectionByMessage = new Map<number, CorrectionDiagnosticSnapshot>();
+let lastCorrectionLogAt = 0;
+let lastRtkStatusLogAt = 0;
 let homeState: HomeState = {
   point: null,
   syncStatus: 'unset',
@@ -133,6 +187,37 @@ type ReturnHomeState = {
   startedAt: string | null;
   completedAt: string | null;
   lastDistanceMeters: number | null;
+};
+
+type GpsLogSnapshot = {
+  fixType: number | null;
+  fixLabel: string;
+  satellites: number | null;
+  hdop: number | null;
+  vdop: number | null;
+  horizontalAccuracy: number | null;
+  lat: number | null;
+  lng: number | null;
+};
+
+type RtkDiagnosticSnapshot = ParsedGpsRtk & {
+  source: string;
+  messageId: number;
+  remote: string;
+  seenAt: string;
+};
+
+type CorrectionDiagnosticSnapshot = ParsedCorrectionData & {
+  source: string;
+  messageId: number;
+  remote: string;
+  seenAt: string;
+};
+
+type MissionBuildResult = {
+  missionId: string | null;
+  items: MissionItem[];
+  capturePlan: CapturePlanInput[];
 };
 
 eventLog.cleanup();
@@ -200,6 +285,7 @@ udp.on('message', (packet, remote) => {
         const gps = parseGpsRawInt(frame.payload);
         if (gps) {
           store.patch(gps);
+          observeGpsState('GPS_RAW_INT', remoteKey);
           packetHadTelemetry = true;
         }
         break;
@@ -208,6 +294,7 @@ udp.on('message', (packet, remote) => {
         const gpsStatus = parseGpsStatus(frame.payload);
         if (gpsStatus) {
           store.patch(gpsStatus);
+          observeGpsState('GPS_STATUS', remoteKey);
           packetHadTelemetry = true;
         }
         break;
@@ -225,6 +312,35 @@ udp.on('message', (packet, remote) => {
         if (hud) {
           store.patch(hud);
           packetHadTelemetry = true;
+        }
+        break;
+      }
+      case 123: {
+        const correction = parseGpsInjectData(frame.payload);
+        if (correction) {
+          observeCorrectionData(frame, remoteKey, 'GPS_INJECT_DATA', correction);
+        }
+        break;
+      }
+      case 124: {
+        const gps2 = parseGps2Raw(frame.payload);
+        if (gps2) {
+          observeGps2State('GPS2_RAW', remoteKey, gps2);
+          packetHadTelemetry = true;
+        }
+        break;
+      }
+      case 127: {
+        const rtk = parseGpsRtk(frame.payload);
+        if (rtk) {
+          observeRtkState(frame, remoteKey, 'GPS_RTK', rtk);
+        }
+        break;
+      }
+      case 128: {
+        const rtk = parseGpsRtk(frame.payload);
+        if (rtk) {
+          observeRtkState(frame, remoteKey, 'GPS2_RTK', rtk);
         }
         break;
       }
@@ -256,6 +372,13 @@ udp.on('message', (packet, remote) => {
             observeVoltage('BATTERY_STATUS', packetVoltage, null, packetBattery, remoteKey);
           }
           packetHadTelemetry = true;
+        }
+        break;
+      }
+      case 233: {
+        const correction = parseRtcmData(frame.payload);
+        if (correction) {
+          observeCorrectionData(frame, remoteKey, 'RTCM_DATA', correction);
         }
         break;
       }
@@ -393,6 +516,210 @@ function observeVoltage(source: string, voltage: number | null, current: number 
   lastVoltageSample = { voltage, at: now };
 }
 
+function observeGpsState(source: string, remote: string): void {
+  const state = store.getState();
+  const snapshot = getGpsLogSnapshot(state);
+  const previous = lastGpsLogSnapshot;
+
+  if (!previous) {
+    lastGpsLogSnapshot = snapshot;
+    logEventFromState('info', 'gps', 'status_initial', `GPS ${snapshot.fixLabel}`, {
+      source,
+      remote,
+      currentGps: snapshot
+    });
+    return;
+  }
+
+  if (snapshot.fixType !== previous.fixType || snapshot.fixLabel !== previous.fixLabel) {
+    const degraded = isRtkFix(previous.fixLabel) && !isRtkFix(snapshot.fixLabel);
+    const restored = !isRtkFix(previous.fixLabel) && isRtkFix(snapshot.fixLabel);
+    const level = degraded ? 'warn' : 'info';
+    const type = degraded ? 'rtk_lost' : restored ? 'rtk_restored' : 'fix_changed';
+    logEventFromState(level, 'gps', type, `GPS fix ${previous.fixLabel} -> ${snapshot.fixLabel}`, {
+      source,
+      remote,
+      previousGps: previous,
+      currentGps: snapshot,
+      diagnostics: getGpsDiagnostics()
+    });
+    lastGpsLogSnapshot = snapshot;
+    return;
+  }
+
+  const now = Date.now();
+  if (!isRtkFix(snapshot.fixLabel) && now - lastGpsDegradedDiagnosticAt >= 60_000) {
+    lastGpsDegradedDiagnosticAt = now;
+    logEventFromState('warn', 'gps', 'rtk_degraded_status', `GPS remains ${snapshot.fixLabel}; RTK diagnostics snapshot`, {
+      source,
+      remote,
+      currentGps: snapshot,
+      diagnostics: getGpsDiagnostics()
+    });
+  }
+
+  if (now - lastGpsQualityLogAt >= 60_000 && gpsQualityChanged(previous, snapshot)) {
+    lastGpsQualityLogAt = now;
+    logEventFromState('info', 'gps', 'quality_changed', `GPS quality ${snapshot.fixLabel}`, {
+      source,
+      remote,
+      previousGps: previous,
+      currentGps: snapshot
+    });
+  }
+  lastGpsLogSnapshot = snapshot;
+}
+
+function observeGps2State(source: string, remote: string, gps2: ParsedGps2Raw): void {
+  const snapshot: GpsLogSnapshot = {
+    fixType: gps2.gpsFixType,
+    fixLabel: gps2.gpsFixLabel,
+    satellites: gps2.gpsSatellites,
+    hdop: gps2.gpsHdop,
+    vdop: gps2.gpsVdop,
+    horizontalAccuracy: gps2.gpsHorizontalAccuracy,
+    lat: gps2.gps2Lat,
+    lng: gps2.gps2Lng
+  };
+  const previous = lastGps2LogSnapshot;
+
+  if (!previous) {
+    lastGps2LogSnapshot = snapshot;
+    logEventFromState('info', 'gps', 'gps2_status_initial', `GPS2 ${snapshot.fixLabel}`, {
+      source,
+      remote,
+      currentGps2: snapshot,
+      dgpsAgeMs: gps2.gps2DgpsAgeMs,
+      dgpsChannels: gps2.gps2DgpsChannels
+    });
+    return;
+  }
+
+  if (snapshot.fixType !== previous.fixType || snapshot.fixLabel !== previous.fixLabel) {
+    const degraded = isRtkFix(previous.fixLabel) && !isRtkFix(snapshot.fixLabel);
+    const restored = !isRtkFix(previous.fixLabel) && isRtkFix(snapshot.fixLabel);
+    logEventFromState(degraded ? 'warn' : 'info', 'gps', degraded ? 'gps2_rtk_lost' : restored ? 'gps2_rtk_restored' : 'gps2_fix_changed', `GPS2 fix ${previous.fixLabel} -> ${snapshot.fixLabel}`, {
+      source,
+      remote,
+      previousGps2: previous,
+      currentGps2: snapshot,
+      dgpsAgeMs: gps2.gps2DgpsAgeMs,
+      dgpsChannels: gps2.gps2DgpsChannels,
+      diagnostics: getGpsDiagnostics()
+    });
+  }
+
+  lastGps2LogSnapshot = snapshot;
+}
+
+function observeRtkState(frame: MavlinkFrame, remote: string, source: string, rtk: ParsedGpsRtk): void {
+  const snapshot: RtkDiagnosticSnapshot = {
+    ...rtk,
+    source,
+    messageId: frame.messageId,
+    remote,
+    seenAt: new Date().toISOString()
+  };
+  const previous = lastRtkByMessage.get(frame.messageId);
+  lastRtkByMessage.set(frame.messageId, snapshot);
+
+  const changed = !previous
+    || previous.health !== snapshot.health
+    || previous.satellites !== snapshot.satellites
+    || Math.abs(previous.accuracyMm - snapshot.accuracyMm) >= 50
+    || previous.rateHz !== snapshot.rateHz
+    || previous.baselineLengthMm !== snapshot.baselineLengthMm;
+  const now = Date.now();
+  if (!changed && now - lastRtkStatusLogAt < 60_000) return;
+
+  lastRtkStatusLogAt = now;
+  logEventFromFrame(frame, remote, snapshot.health === 0 ? 'warn' : 'info', 'gps', 'rtk_status', `${source} health=${snapshot.health} sats=${snapshot.satellites} accuracy=${snapshot.accuracyMm}mm`, {
+    source,
+    previousRtk: previous ?? null,
+    currentRtk: snapshot
+  });
+}
+
+function observeCorrectionData(frame: MavlinkFrame, remote: string, source: string, correction: ParsedCorrectionData): void {
+  const snapshot: CorrectionDiagnosticSnapshot = {
+    ...correction,
+    source,
+    messageId: frame.messageId,
+    remote,
+    seenAt: new Date().toISOString()
+  };
+  lastCorrectionByMessage.set(frame.messageId, snapshot);
+
+  const now = Date.now();
+  if (now - lastCorrectionLogAt < 60_000) return;
+  lastCorrectionLogAt = now;
+  logEventFromFrame(frame, remote, 'info', 'gps', 'correction_seen', `${source} len=${snapshot.length}`, {
+    source,
+    correction: snapshot
+  });
+}
+
+function getGpsLogSnapshot(state: UsvState): GpsLogSnapshot {
+  return {
+    fixType: state.gpsFixType,
+    fixLabel: state.gpsFixLabel,
+    satellites: state.gpsSatellites,
+    hdop: state.gpsHdop,
+    vdop: state.gpsVdop,
+    horizontalAccuracy: state.gpsHorizontalAccuracy,
+    lat: state.lat,
+    lng: state.lng
+  };
+}
+
+function getGpsDiagnostics(): Record<string, unknown> {
+  const now = Date.now();
+  const latestCorrection = latestBySeenAt([...lastCorrectionByMessage.values()]);
+  const latestRtk = latestBySeenAt([...lastRtkByMessage.values()]);
+  return {
+    lastCorrection: latestCorrection,
+    lastCorrectionAgeSeconds: latestCorrection ? Math.max(0, Math.round((now - Date.parse(latestCorrection.seenAt)) / 1000)) : null,
+    rtk: [...lastRtkByMessage.values()],
+    latestRtk,
+    latestRtkAgeSeconds: latestRtk ? Math.max(0, Math.round((now - Date.parse(latestRtk.seenAt)) / 1000)) : null,
+    gps2: lastGps2LogSnapshot,
+    coverage: {
+      gps2RawSeen: lastGps2LogSnapshot !== null,
+      rtkStatusSeen: lastRtkByMessage.size > 0,
+      correctionSeen: lastCorrectionByMessage.size > 0
+    },
+    notes: [
+      latestCorrection ? null : 'No RTCM_DATA/GPS_INJECT_DATA observed on this telemetry link',
+      latestRtk ? null : 'No GPS_RTK/GPS2_RTK observed on this telemetry link',
+      lastGps2LogSnapshot ? null : 'No GPS2_RAW observed on this telemetry link'
+    ].filter(Boolean)
+  };
+}
+
+function latestBySeenAt<T extends { seenAt: string }>(items: T[]): T | null {
+  return items.reduce<T | null>((latest, item) => {
+    if (!latest) return item;
+    return Date.parse(item.seenAt) > Date.parse(latest.seenAt) ? item : latest;
+  }, null);
+}
+
+function isRtkFix(label: string | null | undefined): boolean {
+  return label === 'RTK_FIXED' || label === 'RTK_FLOAT';
+}
+
+function gpsQualityChanged(previous: GpsLogSnapshot, current: GpsLogSnapshot): boolean {
+  if (typeof previous.satellites === 'number' && typeof current.satellites === 'number') {
+    if (Math.abs(current.satellites - previous.satellites) >= 5) return true;
+  }
+  if (typeof previous.hdop === 'number' && typeof current.hdop === 'number') {
+    if (Math.abs(current.hdop - previous.hdop) >= 0.5) return true;
+  }
+  if (typeof previous.horizontalAccuracy === 'number' && typeof current.horizontalAccuracy === 'number') {
+    if (Math.abs(current.horizontalAccuracy - previous.horizontalAccuracy) >= 1) return true;
+  }
+  return false;
+}
+
 function logCommSummary(
   remote: string,
   messageIds: number[],
@@ -447,7 +774,12 @@ function messageName(id: number): string {
     73: 'MISSION_ITEM_INT',
     74: 'VFR_HUD',
     77: 'COMMAND_ACK',
+    123: 'GPS_INJECT_DATA',
+    124: 'GPS2_RAW',
+    127: 'GPS_RTK',
+    128: 'GPS2_RTK',
     147: 'BATTERY_STATUS',
+    233: 'RTCM_DATA',
     253: 'STATUSTEXT'
   };
   return names[id] ?? `MSG_${id}`;
@@ -756,11 +1088,20 @@ function handleMissionRequest(targetSystem: number, targetComponent: number, seq
     const waitSeconds = item.type === 'waypoint' ? sanitizeWaitSeconds(item.waitSeconds) : 0;
     const frame = item.type === 'doJump'
       ? buildMissionDoJumpInt(targetSystem, targetComponent, sequence, item.target, item.repeat)
-      : buildMissionItemInt(targetSystem, targetComponent, sequence, item.lat, item.lng, item.altitude ?? 0, 16, item.type === 'home' ? 0 : 6, waitSeconds);
-    sendMissionFrame(frame, item.type === 'doJump' ? `MISSION_DO_JUMP_INT seq=${sequence}` : `MISSION_ITEM_INT seq=${sequence} hold=${waitSeconds}s`);
+      : item.type === 'aux'
+        ? buildMissionCommandInt(targetSystem, targetComponent, sequence, 181, [item.relay, 1, item.pulseSeconds])
+        : buildMissionItemInt(targetSystem, targetComponent, sequence, item.lat, item.lng, item.altitude ?? 0, 16, item.type === 'home' ? 0 : 6, waitSeconds);
+    const label = item.type === 'doJump'
+      ? `MISSION_DO_JUMP_INT seq=${sequence}`
+      : item.type === 'aux'
+        ? `MISSION_AUX_CAPTURE seq=${sequence} capturePoint=${item.capturePointIndex} relay=${item.relay}`
+        : `MISSION_ITEM_INT seq=${sequence} hold=${waitSeconds}s`;
+    sendMissionFrame(frame, label);
     console.log(item.type === 'doJump'
       ? `Sent DO_JUMP ${sequence}: target=${item.target} repeat=${item.repeat}`
-      : `Sent waypoint ${sequence} as MISSION_ITEM_INT: ${item.lat}, ${item.lng}, hold=${waitSeconds}s`);
+      : item.type === 'aux'
+        ? `Sent AUX capture ${sequence}: point=${item.capturePointIndex} relay=${item.relay} pulse=${item.pulseSeconds}s`
+        : `Sent waypoint ${sequence} as MISSION_ITEM_INT: ${item.lat}, ${item.lng}, hold=${waitSeconds}s`);
   }
 }
 
@@ -871,6 +1212,8 @@ function finishMissionReadback(status: string): void {
     } else if (store.getMissionState().status === 'uploading') {
       store.setMissionStatus('idle');
       pendingMissionItems = [];
+      pendingCaptureMissionId = null;
+      pendingCapturePlan = [];
       broadcast('mission.uploaded', { success: false, result: 'readback-mismatch' });
       console.log('Mission write failed: readback mismatch');
     }
@@ -889,12 +1232,30 @@ function completeMissionWrite(source: string): void {
   pendingMissionItems = [];
   store.setMissionWaypoints(items);
   store.setMissionStatus('ready');
-  broadcast('mission.uploaded', { success: true, source });
+  if (pendingCaptureMissionId) {
+    currentCaptureMissionId = pendingCaptureMissionId;
+    captureStore.savePlan(pendingCaptureMissionId, pendingCapturePlan);
+    const capturePlan = captureStore.getMissionStatus(pendingCaptureMissionId);
+    broadcastPi('capture.plan', {
+      missionId: pendingCaptureMissionId,
+      plans: pendingCapturePlan
+    });
+    broadcast('capture.plan', capturePlan);
+    logEventFromState('info', 'capture', 'plan_ready', `Capture plan ready ${pendingCaptureMissionId}`, {
+      missionId: pendingCaptureMissionId,
+      capturePoints: pendingCapturePlan.length
+    });
+  }
+  broadcast('mission.uploaded', { success: true, source, missionId: currentCaptureMissionId });
   console.log(`Mission waypoints written successfully via ${source}; ready to start`);
   logEventFromState('info', 'mission', 'upload_completed', `Mission upload completed via ${source}`, {
     source,
-    itemCount: items.length
+    itemCount: items.length,
+    captureMissionId: currentCaptureMissionId,
+    capturePoints: pendingCapturePlan.length
   });
+  pendingCaptureMissionId = null;
+  pendingCapturePlan = [];
 }
 
 function missionItemsMatchReadback(expected: MissionItem[], actual: ParsedMissionItem[]): boolean {
@@ -908,6 +1269,11 @@ function missionItemsMatchReadback(expected: MissionItem[], actual: ParsedMissio
       if (actualItem.command !== 177) return false;
       if (Math.round(actualItem.param1) !== expectedItem.target) return false;
       if (Math.round(actualItem.param2) !== expectedItem.repeat) return false;
+      continue;
+    }
+    if (expectedItem.type === 'aux') {
+      if (actualItem.command !== 181) return false;
+      if (Math.round(actualItem.param1) !== expectedItem.relay) return false;
       continue;
     }
     if (actualItem.command !== 16) return false;
@@ -929,6 +1295,8 @@ function handleMissionAck(type: number, result: number): void {
   } else {
     missionUploadInProgress = false;
     pendingMissionItems = [];
+    pendingCaptureMissionId = null;
+    pendingCapturePlan = [];
     store.setMissionStatus('idle');
     broadcast('mission.uploaded', { success: false, result });
     console.log(`Mission upload failed: type=${type} result=${result}`);
@@ -945,16 +1313,21 @@ function uploadMission(waypoints: Waypoint[], loopCount = 1): { ok: boolean; mes
   if (!state.online || !state.remote) return { ok: false, message: 'USV offline' };
   if (waypoints.length === 0) return { ok: false, message: 'No waypoints' };
 
-  const missionItems = buildMissionItems(waypoints, loopCount, state);
+  const built = buildMissionItems(waypoints, loopCount, state);
+  const missionItems = built.items;
   const remote = state.remote;
   missionUploadInProgress = false;
   pendingMissionItems = missionItems;
   lastUploadMissionItems = missionItems;
+  pendingCaptureMissionId = built.missionId;
+  pendingCapturePlan = built.capturePlan;
   store.setMissionStatus('uploading');
   logEventFromState('info', 'mission', 'upload_started', `Mission upload started with ${missionItems.length} items`, {
     waypointCount: waypoints.length,
     itemCount: missionItems.length,
     loopCount,
+    captureMissionId: built.missionId,
+    capturePoints: built.capturePlan.length,
     waypointWaits: missionItems
       .filter((item): item is Waypoint & { type: 'waypoint'; altitude?: number } => item.type === 'waypoint')
       .map((item) => ({ order: item.order, waitSeconds: sanitizeWaitSeconds(item.waitSeconds) }))
@@ -970,7 +1343,7 @@ function uploadMission(waypoints: Waypoint[], loopCount = 1): { ok: boolean; mes
     startMissionUploadTimeout();
     const countFrame = buildMissionCount(state.systemId, state.componentId || 1, missionItems.length);
     sendMissionFrame(countFrame, `MISSION_COUNT count=${missionItems.length}`);
-    console.log(`Uploading mission with ${missionItems.length} items (${waypoints.length} waypoints, loop=${loopCount})`);
+    console.log(`Uploading mission with ${missionItems.length} items (${waypoints.length} waypoints, loop=${loopCount}, capture=${built.capturePlan.length})`);
   }, MISSION_CLEAR_BEFORE_UPLOAD_DELAY_MS);
 
   return { ok: true, message: 'Mission upload started' };
@@ -981,6 +1354,8 @@ function startMissionUploadTimeout(): void {
   missionUploadTimer = setTimeout(() => {
     if (!missionUploadInProgress) return;
     missionUploadInProgress = false;
+    pendingCaptureMissionId = null;
+    pendingCapturePlan = [];
     console.log(`Mission upload timeout after ${MISSION_UPLOAD_TIMEOUT_MS}ms waiting for MISSION_ACK`);
     logEventFromState('warn', 'mission', 'upload_timeout', `Mission upload timeout after ${MISSION_UPLOAD_TIMEOUT_MS}ms`, {
       timeoutMs: MISSION_UPLOAD_TIMEOUT_MS,
@@ -1004,10 +1379,12 @@ function clearMissionUploadTimeout(): void {
   missionUploadTimer = null;
 }
 
-function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvState): MissionItem[] {
+function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvState): MissionBuildResult {
   const sanitizedLoopCount = Math.max(1, Math.min(10, Math.round(loopCount || 1)));
   const homeLat = state.lat ?? waypoints[0].lat;
   const homeLng = state.lng ?? waypoints[0].lng;
+  const missionId = createMissionId();
+  const capturePlan: CapturePlanInput[] = [];
   const items: MissionItem[] = [{
     type: 'home',
     order: 0,
@@ -1016,12 +1393,45 @@ function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvS
     altitude: state.gpsAltitude ?? 0
   }];
 
-  items.push(...waypoints.map((point, index) => ({
-    ...point,
-    order: index + 1,
-    type: 'waypoint' as const,
-    waitSeconds: sanitizeWaitSeconds(point.waitSeconds)
-  })));
+  let capturePointIndex = 0;
+  for (const [index, point] of waypoints.entries()) {
+    const isCapturePoint = point.captureEnabled === true;
+    const waypointSeq = items.length;
+    const normalizedPoint: Waypoint & { type: 'waypoint'; altitude?: number } = {
+      ...point,
+      order: index + 1,
+      type: 'waypoint',
+      captureEnabled: isCapturePoint,
+      capturePointIndex: isCapturePoint ? capturePointIndex + 1 : undefined,
+      expectedPhotoCount: sanitizeExpectedPhotoCount(point.expectedPhotoCount),
+      captureStepDeg: sanitizeCaptureStepDeg(point.captureStepDeg),
+      waitSeconds: isCapturePoint
+        ? sanitizeWaitSeconds(point.waitSeconds ?? CAPTURE_DEFAULT_WAIT_SECONDS)
+        : sanitizeWaitSeconds(point.waitSeconds)
+    };
+    items.push(normalizedPoint);
+    if (isCapturePoint) {
+      capturePointIndex += 1;
+      capturePlan.push({
+        missionId,
+        deviceId: state.deviceId,
+        capturePointIndex,
+        waypointSeq,
+        lat: point.lat,
+        lng: point.lng,
+        waitSeconds: sanitizeWaitSeconds(normalizedPoint.waitSeconds),
+        expectedPhotoCount: normalizedPoint.expectedPhotoCount ?? CAPTURE_DEFAULT_PHOTO_COUNT,
+        captureStepDeg: normalizedPoint.captureStepDeg ?? CAPTURE_DEFAULT_STEP_DEG
+      });
+      items.push({
+        type: 'aux',
+        order: items.length,
+        capturePointIndex,
+        relay: sanitizeRelay(CAPTURE_AUX_RELAY),
+        pulseSeconds: sanitizePulseSeconds(CAPTURE_AUX_PULSE_SECONDS)
+      });
+    }
+  }
 
   if (sanitizedLoopCount > 1 && waypoints.length > 0) {
     items.push({
@@ -1042,13 +1452,109 @@ function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvS
     });
   }
 
-  return items;
+  return {
+    missionId: capturePlan.length > 0 ? missionId : null,
+    items,
+    capturePlan
+  };
 }
 
 function sanitizeWaitSeconds(value: unknown): number {
   const numeric = typeof value === 'number' ? value : Number(value ?? 0);
   if (!Number.isFinite(numeric)) return 0;
   return Math.max(WAYPOINT_WAIT_MIN_SECONDS, Math.min(WAYPOINT_WAIT_MAX_SECONDS, Math.round(numeric)));
+}
+
+function sanitizeExpectedPhotoCount(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value ?? CAPTURE_DEFAULT_PHOTO_COUNT);
+  if (!Number.isFinite(numeric)) return CAPTURE_DEFAULT_PHOTO_COUNT;
+  return Math.max(1, Math.min(200, Math.round(numeric)));
+}
+
+function sanitizeCaptureStepDeg(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value ?? CAPTURE_DEFAULT_STEP_DEG);
+  if (!Number.isFinite(numeric)) return CAPTURE_DEFAULT_STEP_DEG;
+  return Math.max(1, Math.min(360, Math.round(numeric)));
+}
+
+function sanitizePositiveInt(value: unknown, fallback: number): number {
+  const numeric = typeof value === 'number' ? value : Number(value ?? fallback);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.round(numeric));
+}
+
+function sanitizeCaptureDate(value: string, takenAt?: string | null): string {
+  if (/^\d{8}$/.test(value)) return value;
+  const parsed = takenAt ? new Date(takenAt) : new Date();
+  if (!Number.isNaN(parsed.getTime())) return formatCaptureDate(parsed);
+  return formatCaptureDate(new Date());
+}
+
+function formatCaptureDate(date: Date): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}${month}${day}`;
+}
+
+function sanitizeRelay(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value ?? 0);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(0, Math.min(15, Math.round(numeric)));
+}
+
+function sanitizePulseSeconds(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value ?? 1);
+  if (!Number.isFinite(numeric)) return 1;
+  return Math.max(0.1, Math.min(30, numeric));
+}
+
+function createMissionId(): string {
+  return `mission-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function createTestCapturePlan(input: unknown): { code: number; data: { missionId: string | null; deviceId: string; captureDate: string; points: CapturePointStatus[] }; message: string } {
+  const payload = input as Partial<{
+    deviceId: string;
+    lat: number;
+    lng: number;
+    waitSeconds: number;
+    expectedPhotoCount: number;
+    captureStepDeg: number;
+  }>;
+  const state = store.getState();
+  const deviceId = String(payload.deviceId || state.deviceId || 'usv-001');
+  const captureDate = formatCaptureDate(new Date());
+  const lat = Number.isFinite(Number(payload.lat)) ? Number(payload.lat) : state.lat ?? 0;
+  const lng = Number.isFinite(Number(payload.lng)) ? Number(payload.lng) : state.lng ?? 0;
+  const point = captureStore.ensureDailyPoint({
+    deviceId,
+    captureDate,
+    pointIndex: 1,
+    lat,
+    lng,
+    waitSeconds: sanitizeWaitSeconds(payload.waitSeconds ?? CAPTURE_DEFAULT_WAIT_SECONDS),
+    expectedPhotoCount: sanitizeExpectedPhotoCount(payload.expectedPhotoCount ?? CAPTURE_DEFAULT_PHOTO_COUNT),
+    captureStepDeg: sanitizeCaptureStepDeg(payload.captureStepDeg ?? CAPTURE_DEFAULT_STEP_DEG)
+  });
+  const status = captureStore.getDailyStatus(deviceId, captureDate);
+  broadcastPi('capture.plan', {
+    deviceId,
+    captureDate,
+    points: status.points.map((item) => item.plan)
+  });
+  broadcast('capture.plan', status);
+  logEventFromState('info', 'capture', 'test_plan_created', `Test capture point created date=${captureDate} point=1`, {
+    deviceId,
+    captureDate,
+    pointIndex: 1,
+    expectedPhotoCount: point.plan.expected_photo_count
+  });
+  return {
+    code: 200,
+    message: 'test capture plan created',
+    data: status
+  };
 }
 
 function handleMissionReached(seq: number): void {
@@ -1137,10 +1643,14 @@ function clearMission(): { ok: boolean; message: string } {
   missionUploadInProgress = false;
   pendingMissionItems = [];
   lastUploadMissionItems = [];
+  pendingCaptureMissionId = null;
+  pendingCapturePlan = [];
+  currentCaptureMissionId = null;
   clearMissionUploadTimers();
   sendMissionFrame(frame, 'MISSION_CLEAR_ALL');
   store.clearMission();
   broadcast('mission.cleared', {});
+  broadcast('capture.plan', { missionId: null, points: [] });
   logEventFromState('info', 'mission', 'cleared', 'Mission cleared');
   return { ok: true, message: 'Mission cleared' };
 }
@@ -1151,6 +1661,161 @@ function requestMissionReadback(reason: string): { ok: boolean; message: string 
   startMissionReadback(reason);
   return { ok: true, message: 'Mission readback requested' };
 }
+
+async function handleCaptureUpload(req: http.IncomingMessage): Promise<{ ok: boolean; status: number; body: unknown }> {
+  const contentTypeHeader = req.headers['content-type'] ?? '';
+  const boundary = String(contentTypeHeader).match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[1]
+    ?? String(contentTypeHeader).match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[2];
+  if (!boundary) return { ok: false, status: 400, body: { code: 400, message: 'multipart boundary missing' } };
+
+  const parts = parseMultipart(await readRawBody(req), boundary);
+  const field = (name: string) => parts.find((part) => part.name === name && !part.filename)?.data.toString('utf8').trim() ?? '';
+  const file = parts.find((part) => part.filename);
+  if (!file) return { ok: false, status: 400, body: { code: 400, message: 'image file missing' } };
+
+  const state = store.getState();
+  const deviceId = field('deviceId') || state.deviceId || 'usv-001';
+  const takenAt = field('takenAt') || null;
+  const captureDate = sanitizeCaptureDate(field('captureDate'), takenAt);
+  const pointIndex = sanitizePositiveInt(field('pointIndex') || field('capturePointIndex'), 1);
+  const photoIndex = sanitizePositiveInt(field('photoIndex'), 0);
+  if (photoIndex <= 0) return { ok: false, status: 400, body: { code: 400, message: 'photoIndex missing or invalid' } };
+  const angleDegRaw = field('angleDeg');
+  const angleDeg = angleDegRaw ? Number(angleDegRaw) : null;
+  const filePath = captureStore.makeDailyImagePath(deviceId, captureDate, pointIndex, photoIndex, file.filename ?? null);
+  await writeFile(filePath, file.data);
+  const pointStatus = captureStore.insertDailyImage({
+    deviceId,
+    captureDate,
+    pointIndex,
+    photoIndex,
+    angleDeg: Number.isFinite(angleDeg) ? angleDeg : null,
+    takenAt,
+    filePath,
+    originalName: file.filename ?? null,
+    mimeType: file.contentType ?? null,
+    sizeBytes: file.data.length
+  });
+  const image = captureStore.getDailyImage(deviceId, captureDate, pointIndex, photoIndex);
+  if (image) {
+    if (aiDetectionEnabled) {
+      captureStore.queueDetection(image.id, OUTFALL_MODEL_PATH);
+      void processDetectionQueue();
+      logEventFromState('info', 'capture', 'detection_queued', `Outfall detection queued image=${image.id}`, {
+        imageId: image.id,
+        deviceId,
+        captureDate,
+        pointIndex,
+        photoIndex,
+        modelPath: OUTFALL_MODEL_PATH
+      });
+    } else {
+      captureStore.skipDetection(image.id);
+      logEventFromState('info', 'capture', 'detection_skipped', `Outfall detection skipped image=${image.id}`, {
+        imageId: image.id,
+        deviceId,
+        captureDate,
+        pointIndex,
+        photoIndex
+      });
+    }
+  }
+  const captureStatus = captureStore.getDailyStatus(deviceId, captureDate);
+  broadcast('capture.updated', captureStatus);
+  logEventFromState('info', 'capture', 'image_uploaded', `Capture image uploaded date=${captureDate} point=${pointIndex} photo=${photoIndex}`, {
+    deviceId,
+    captureDate,
+    pointIndex,
+    photoIndex,
+    angleDeg: Number.isFinite(angleDeg) ? angleDeg : null,
+    sizeBytes: file.data.length,
+    missing: pointStatus?.missing
+  });
+
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      code: 200,
+      data: {
+        deviceId,
+        captureDate,
+        pointIndex,
+        received: pointStatus.received,
+        missing: pointStatus.missing,
+        complete: pointStatus.complete
+      }
+    }
+  };
+}
+
+function handleCaptureStatus(input: unknown): CapturePointStatus | null {
+  const data = input as Partial<{ missionId: string; deviceId: string; capturePointIndex: number; captureDate: string; pointIndex: number; status: string }>;
+  const deviceId = data.deviceId || store.getState().deviceId;
+  const status = captureStore.markActivity({
+    captureDate: data.captureDate,
+    pointIndex: data.pointIndex,
+    missionId: data.missionId,
+    deviceId,
+    capturePointIndex: data.capturePointIndex == null ? undefined : Number(data.capturePointIndex),
+    status: data.status || 'shooting'
+  });
+  if (status) {
+    if (data.captureDate) broadcast('capture.updated', captureStore.getDailyStatus(deviceId, data.captureDate));
+    else if (data.missionId) broadcast('capture.updated', captureStore.getMissionStatus(data.missionId));
+  }
+  return status;
+}
+
+function runCaptureCompletenessChecks(): void {
+  const due = captureStore.listDueChecks(CAPTURE_UPLOAD_CHECK_DELAY_SECONDS, CAPTURE_REUPLOAD_MAX_ATTEMPTS);
+  for (const point of due) {
+    if (point.missing.length === 0) {
+      if (point.plan.capture_date && point.plan.point_index) {
+        captureStore.setDailyPointStatus(point.plan.device_id, point.plan.capture_date, point.plan.point_index, 'complete');
+      } else {
+        captureStore.setPointStatus(point.plan.mission_id, point.plan.capture_point_index, 'complete');
+      }
+      continue;
+    }
+    captureStore.recordReuploadAttempt(point.plan);
+    const command = point.plan.capture_date && point.plan.point_index
+      ? {
+          deviceId: point.plan.device_id,
+          captureDate: point.plan.capture_date,
+          pointIndex: point.plan.point_index,
+          missing: point.missing
+        }
+      : {
+          missionId: point.plan.mission_id,
+          deviceId: point.plan.device_id,
+          capturePointIndex: point.plan.capture_point_index,
+          missing: point.missing
+        };
+    broadcastPi('capture.reupload', command);
+    broadcast('capture.updated', point.plan.capture_date
+      ? captureStore.getDailyStatus(point.plan.device_id, point.plan.capture_date)
+      : captureStore.getMissionStatus(point.plan.mission_id));
+    logEventFromState('warn', 'capture', 'reupload_requested', `Capture reupload requested point=${point.plan.point_index ?? point.plan.capture_point_index}`, {
+      ...command,
+      attempt: point.plan.reupload_attempts + 1
+    });
+  }
+  for (const point of captureStore.markIncompleteAfterMax(CAPTURE_REUPLOAD_MAX_ATTEMPTS)) {
+    broadcast('capture.updated', point.plan.capture_date
+      ? captureStore.getDailyStatus(point.plan.device_id, point.plan.capture_date)
+      : captureStore.getMissionStatus(point.plan.mission_id));
+    logEventFromState('warn', 'capture', 'incomplete', `Capture point incomplete point=${point.plan.point_index ?? point.plan.capture_point_index}`, {
+      deviceId: point.plan.device_id,
+      captureDate: point.plan.capture_date,
+      pointIndex: point.plan.point_index,
+      missing: point.missing,
+      attempts: point.plan.reupload_attempts
+    });
+  }
+}
+
+setInterval(runCaptureCompletenessChecks, 30_000);
 
 const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -1187,6 +1852,88 @@ const httpServer = http.createServer(async (req, res) => {
       ? eventLog.exportTelemetryCsv(telemetryQueryFromUrl(url))
       : eventLog.exportEventsCsv(eventQueryFromUrl(url));
     return sendCsv(res, `usv-${kind}-${new Date().toISOString().replaceAll(':', '-')}.csv`, csv);
+  }
+
+  if (url.pathname === '/api/capture-plan/current') {
+    const data = captureStore.getCurrentPlan(url.searchParams.get('deviceId'));
+    return sendJson(res, 200, { code: 200, data });
+  }
+
+  if (url.pathname === '/api/pi/status') {
+    return sendJson(res, 200, { code: 200, data: publicPiStatus(url.searchParams.get('deviceId')) });
+  }
+
+  if (url.pathname === '/api/detections/settings' && req.method === 'GET') {
+    return sendJson(res, 200, { code: 200, data: publicDetectionSettings() });
+  }
+
+  if (url.pathname === '/api/detections/settings' && req.method === 'POST') {
+    const body = await readBody(req);
+    const result = updateDetectionSettings(body);
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
+  if (url.pathname === '/api/capture-plan/test' && req.method === 'POST') {
+    const body = await readBody(req);
+    const result = createTestCapturePlan(body);
+    return sendJson(res, 200, result);
+  }
+
+  if (url.pathname === '/api/captures') {
+    const deviceId = url.searchParams.get('deviceId');
+    const captureDate = url.searchParams.get('captureDate');
+    const missionId = url.searchParams.get('missionId');
+    if (missionId) return sendJson(res, 200, { code: 200, data: captureStore.getMissionStatus(missionId) });
+    return sendJson(res, 200, { code: 200, data: captureStore.getCurrentCapture(deviceId, captureDate) });
+  }
+
+  if (url.pathname === '/api/captures/upload' && req.method === 'POST') {
+    const result = await handleCaptureUpload(req);
+    return sendJson(res, result.status, result.body);
+  }
+
+  if (url.pathname === '/api/captures/reupload' && req.method === 'POST') {
+    const body = await readBody(req);
+    const result = requestManualCaptureReupload(body);
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
+  const detectMatch = url.pathname.match(/^\/api\/captures\/(\d+)\/detect$/);
+  if (detectMatch && req.method === 'POST') {
+    const result = requestCaptureDetection(Number(detectMatch[1]));
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
+  if (url.pathname === '/api/camera/trigger' && req.method === 'POST') {
+    const body = await readBody(req);
+    const result = triggerCameraRelay(body);
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
+  const imageMatch = url.pathname.match(/^\/api\/captures\/(\d+)\/original$/);
+  if (imageMatch && req.method === 'GET') {
+    const image = captureStore.openImage(Number(imageMatch[1]));
+    if (!image) return sendJson(res, 404, { code: 404, message: 'image not found' });
+    res.writeHead(200, {
+      'Content-Type': image.row.mime_type || 'application/octet-stream',
+      'Content-Disposition': `inline; filename="capture-${image.row.id}${extname(image.row.file_path) || ''}"`,
+      'Access-Control-Allow-Origin': '*'
+    });
+    image.stream.pipe(res);
+    return;
+  }
+
+  const annotatedMatch = url.pathname.match(/^\/api\/captures\/(\d+)\/annotated$/);
+  if (annotatedMatch && req.method === 'GET') {
+    const image = captureStore.openAnnotatedImage(Number(annotatedMatch[1]));
+    if (!image) return sendJson(res, 404, { code: 404, message: 'annotated image not found' });
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Content-Disposition': `inline; filename="capture-${image.row.id}-detected.jpg"`,
+      'Access-Control-Allow-Origin': '*'
+    });
+    image.stream.pipe(res);
+    return;
   }
 
   if (url.pathname === '/api/mission/upload' && req.method === 'POST') {
@@ -1227,6 +1974,12 @@ const httpServer = http.createServer(async (req, res) => {
     return sendJson(res, result.ok ? 200 : 400, result);
   }
 
+  if (url.pathname === '/api/command-line' && req.method === 'POST') {
+    const body = await readBody(req);
+    const result = handleCommandLine(body);
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
   if (url.pathname.startsWith('/api/')) {
     return sendJson(res, 404, { code: 404, message: 'not found' });
   }
@@ -1234,13 +1987,35 @@ const httpServer = http.createServer(async (req, res) => {
   return serveClient(req, res);
 });
 
-const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+const wss = new WebSocketServer({ noServer: true });
+const piWss = new WebSocketServer({ noServer: true });
+
+httpServer.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+  const target = url.pathname === '/ws'
+    ? wss
+    : url.pathname === '/api/pi/ws'
+      ? piWss
+      : null;
+
+  if (!target) {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  target.handleUpgrade(req, socket, head, (ws) => {
+    target.emit('connection', ws, req);
+  });
+});
 
 wss.on('connection', (ws) => {
   clients.add(ws);
   sendWs(ws, 'usv.telemetry', publicState());
   sendWs(ws, 'home.updated', publicHomeState());
   sendWs(ws, 'return.home', publicReturnHomeState());
+  sendWs(ws, 'detections.settings', publicDetectionSettings());
+  sendWs(ws, 'capture.updated', captureStore.getCurrentCapture());
 
   ws.on('message', (raw) => {
     try {
@@ -1302,13 +2077,79 @@ wss.on('connection', (ws) => {
   });
 });
 
+piWss.on('connection', (ws) => {
+  piClients.set(ws, {
+    connectedAt: new Date().toISOString(),
+    registeredAt: null,
+    deviceId: null,
+    piId: null,
+    firmwareVersion: null,
+    cameraCount: null,
+    lastHeartbeatAt: null,
+    lastMessageType: null,
+    lastMessageAt: null,
+    lastCaptureStatus: null,
+    lastReuploadResult: null
+  });
+  sendWs(ws, 'capture.plan', captureStore.getCurrentCapture());
+
+  ws.on('message', (raw) => {
+    try {
+      const message = JSON.parse(raw.toString()) as { type?: string; data?: unknown };
+      updatePiClient(ws, message.type || 'unknown');
+      if (message.type === 'pi.register') {
+        const data = message.data as Partial<{ deviceId: string; piId: string; firmwareVersion: string; cameraCount: number }> | undefined;
+        updatePiClient(ws, 'pi.register', {
+          registeredAt: new Date().toISOString(),
+          deviceId: data?.deviceId ?? store.getState().deviceId,
+          piId: data?.piId ?? null,
+          firmwareVersion: data?.firmwareVersion ?? null,
+          cameraCount: typeof data?.cameraCount === 'number' ? data.cameraCount : null
+        });
+        sendWs(ws, 'pi.registered', {
+          deviceId: data?.deviceId ?? store.getState().deviceId,
+          currentMissionId: currentCaptureMissionId
+        });
+        sendWs(ws, 'capture.plan', captureStore.getCurrentCapture(data?.deviceId));
+        logEventFromState('info', 'capture', 'pi_registered', 'Raspberry Pi registered', message.data as Record<string, unknown>);
+        return;
+      }
+      if (message.type === 'pi.heartbeat') {
+        updatePiClient(ws, 'pi.heartbeat', { lastHeartbeatAt: new Date().toISOString() });
+        sendWs(ws, 'pi.heartbeat', { ok: true });
+        return;
+      }
+      if (message.type === 'capture.status') {
+        updatePiClient(ws, 'capture.status', { lastCaptureStatus: message.data });
+        const status = handleCaptureStatus(message.data);
+        sendWs(ws, 'capture.status', { ok: !!status, status });
+        return;
+      }
+      if (message.type === 'capture.reupload.result') {
+        updatePiClient(ws, 'capture.reupload.result', { lastReuploadResult: message.data });
+        logEventFromState('info', 'capture', 'reupload_result', 'Capture reupload result', message.data as Record<string, unknown>);
+        return;
+      }
+      sendWs(ws, 'error', { message: 'unknown pi message type' });
+    } catch {
+      sendWs(ws, 'error', { message: 'Invalid WebSocket message' });
+    }
+  });
+
+  ws.on('close', () => {
+    piClients.delete(ws);
+  });
+});
+
 httpServer.listen(HTTP_PORT, () => {
   console.log(`HTTP/WebSocket listening on http://127.0.0.1:${HTTP_PORT}`);
+  void processDetectionQueue();
 });
 
 function shutdown(signal: string): void {
   logEventFromState('info', 'service', 'shutdown', `USV service stopping (${signal})`, { signal });
   eventLog.close();
+  captureStore.close();
   process.exit(0);
 }
 
@@ -1346,6 +2187,413 @@ function handleControl(body: unknown): { ok: boolean; message: string } {
     });
   }
   return { ok: false, message: 'unknown action' };
+}
+
+function publicDetectionSettings(): { enabled: boolean; modelPath: string; confidence: number } {
+  return {
+    enabled: aiDetectionEnabled,
+    modelPath: OUTFALL_MODEL_PATH,
+    confidence: OUTFALL_CONFIDENCE
+  };
+}
+
+function updateDetectionSettings(input: unknown): { ok: boolean; message: string; data: { enabled: boolean; modelPath: string; confidence: number } } {
+  const payload = input as { enabled?: unknown };
+  if (typeof payload.enabled !== 'boolean') {
+    return {
+      ok: false,
+      message: 'enabled must be boolean',
+      data: publicDetectionSettings()
+    };
+  }
+
+  const previous = aiDetectionEnabled;
+  aiDetectionEnabled = payload.enabled;
+  const settings = publicDetectionSettings();
+  broadcast('detections.settings', settings);
+
+  if (previous !== aiDetectionEnabled) {
+    logEventFromState('info', 'capture', aiDetectionEnabled ? 'detection_enabled' : 'detection_disabled',
+      aiDetectionEnabled ? 'Outfall AI detection enabled' : 'Outfall AI detection disabled',
+      settings);
+  }
+
+  return {
+    ok: true,
+    message: aiDetectionEnabled ? 'AI detection enabled' : 'AI detection disabled',
+    data: settings
+  };
+}
+
+function requestCaptureDetection(imageId: number): { ok: boolean; message: string; data?: Record<string, unknown> } {
+  if (!aiDetectionEnabled) return { ok: false, message: 'AI detection disabled' };
+  const image = captureStore.getImage(imageId);
+  if (!image) return { ok: false, message: 'image not found' };
+  const detection = captureStore.queueDetection(image.id, OUTFALL_MODEL_PATH);
+  void processDetectionQueue();
+  logEventFromState('info', 'capture', 'detection_queued', `Outfall detection queued image=${image.id}`, {
+    imageId: image.id,
+    deviceId: image.device_id,
+    captureDate: image.capture_date,
+    pointIndex: image.point_index,
+    photoIndex: image.photo_index,
+    modelPath: OUTFALL_MODEL_PATH,
+    manual: true
+  });
+  if (image.capture_date) broadcast('capture.updated', captureStore.getDailyStatus(image.device_id, image.capture_date));
+  return {
+    ok: true,
+    message: 'AI detection queued',
+    data: { detection }
+  };
+}
+
+async function processDetectionQueue(): Promise<void> {
+  if (detectionWorkerRunning) return;
+  detectionWorkerRunning = true;
+  try {
+    while (true) {
+      const next = captureStore.listPendingDetections(1)[0];
+      if (!next) break;
+      const image = captureStore.getImage(next.image_id);
+      if (!image) {
+        captureStore.markDetectionFailed(next.image_id, 'image not found');
+        continue;
+      }
+      await runCaptureDetection(image.id);
+    }
+  } finally {
+    detectionWorkerRunning = false;
+  }
+}
+
+async function runCaptureDetection(imageId: number): Promise<void> {
+  const image = captureStore.getImage(imageId);
+  if (!image) {
+    captureStore.markDetectionFailed(imageId, 'image not found');
+    return;
+  }
+
+  const annotatedPath = captureStore.makeAnnotatedImagePath(image);
+  captureStore.markDetectionRunning(image.id, null);
+  broadcastCaptureForImage(image);
+
+  try {
+    await access(resolve(OUTFALL_MODEL_PATH), fsConstants.R_OK);
+    await access(resolve(OUTFALL_DETECTION_SCRIPT), fsConstants.R_OK);
+    const result = await runOutfallDetector({
+      modelPath: resolve(OUTFALL_MODEL_PATH),
+      imagePath: image.file_path,
+      annotatedPath,
+      confidence: OUTFALL_CONFIDENCE
+    });
+    const detectionsJson = JSON.stringify(result.detections ?? []);
+    const detection = captureStore.markDetectionComplete({
+      imageId: image.id,
+      modelPath: OUTFALL_MODEL_PATH,
+      device: result.device ?? null,
+      inferenceMs: typeof result.inference_ms === 'number' ? result.inference_ms : null,
+      detectionsJson,
+      detectedCount: Array.isArray(result.detections) ? result.detections.length : 0,
+      annotatedPath
+    });
+    logEventFromState('info', 'capture', 'detection_complete', `Outfall detection complete image=${image.id}`, {
+      imageId: image.id,
+      deviceId: image.device_id,
+      captureDate: image.capture_date,
+      pointIndex: image.point_index,
+      photoIndex: image.photo_index,
+      detectedCount: detection?.detected_count ?? 0,
+      inferenceMs: detection?.inference_ms ?? null,
+      annotatedPath
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    captureStore.markDetectionFailed(image.id, message);
+    logEventFromState('warn', 'capture', 'detection_failed', `Outfall detection failed image=${image.id}`, {
+      imageId: image.id,
+      deviceId: image.device_id,
+      captureDate: image.capture_date,
+      pointIndex: image.point_index,
+      photoIndex: image.photo_index,
+      error: message
+    });
+  } finally {
+    broadcastCaptureForImage(image);
+  }
+}
+
+type OutfallDetectorResult = {
+  model_path?: string;
+  device?: string;
+  inference_ms?: number;
+  detections?: unknown[];
+  annotated_path?: string;
+};
+
+function runOutfallDetector(input: {
+  modelPath: string;
+  imagePath: string;
+  annotatedPath: string;
+  confidence: number;
+}): Promise<OutfallDetectorResult> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(OUTFALL_DETECTION_PYTHON, [
+      OUTFALL_DETECTION_SCRIPT,
+      '--model',
+      input.modelPath,
+      '--image',
+      input.imagePath,
+      '--output',
+      input.annotatedPath,
+      '--conf',
+      String(input.confidence)
+    ], {
+      cwd: process.cwd(),
+      windowsHide: true
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error((stderr || stdout || `detector exited with code ${code}`).trim()));
+        return;
+      }
+      try {
+        const lastLine = stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
+        if (!lastLine) throw new Error('detector returned empty output');
+        resolvePromise(JSON.parse(lastLine) as OutfallDetectorResult);
+      } catch (error) {
+        reject(new Error(`failed to parse detector output: ${error instanceof Error ? error.message : String(error)}`));
+      }
+    });
+  });
+}
+
+function broadcastCaptureForImage(image: { device_id: string; capture_date: string | null; mission_id: string }): void {
+  if (image.capture_date) {
+    broadcast('capture.updated', captureStore.getDailyStatus(image.device_id, image.capture_date));
+  } else {
+    broadcast('capture.updated', captureStore.getMissionStatus(image.mission_id));
+  }
+}
+
+function handleCommandLine(body: unknown): { ok: boolean; message: string; data?: Record<string, unknown> } {
+  const payload = body as { command?: string };
+  const input = String(payload.command || '').trim();
+  if (!input) return { ok: false, message: 'command is empty' };
+
+  const tokens = input.split(/\s+/);
+  const verb = tokens[0]?.toLowerCase();
+  const args = tokens.slice(1);
+  const state = store.getState();
+
+  const logCommand = (ok: boolean, message: string, details: Record<string, unknown> = {}) => {
+    logEventFromState(ok ? 'info' : 'warn', 'control', 'command_line', message, {
+      input,
+      ...details
+    });
+  };
+
+  try {
+    if (verb === 'arm') return withCommandLog(sendArm(true), logCommand, { action: 'arm' });
+    if (verb === 'disarm') return withCommandLog(sendArm(false), logCommand, { action: 'disarm' });
+    if (verb === 'stop' || verb === 'emergency' || verb === 'emergencystop') {
+      return withCommandLog(sendEmergencyStop(), logCommand, { action: 'emergencyStop' });
+    }
+    if (verb === 'return' || verb === 'rtl') {
+      return withCommandLog(startReturnHome('command_line'), logCommand, { action: 'returnHome' });
+    }
+    if (verb === 'reboot') {
+      if (args[0]?.toLowerCase() !== 'confirm') {
+        const result = { ok: false, message: 'reboot requires: reboot confirm' };
+        logCommand(false, result.message, { action: 'reboot' });
+        return result;
+      }
+      return withCommandLog(sendRebootAutopilot(), logCommand, { action: 'reboot' });
+    }
+    if (verb === 'mode') {
+      const mode = args[0];
+      if (!mode) return { ok: false, message: 'mode required, e.g. mode hold' };
+      return withCommandLog(sendSetMode(mode), logCommand, { action: 'setMode', mode });
+    }
+    if (verb === 'manual') {
+      const throttle = Number(args[0] ?? 0);
+      const steering = Number(args[1] ?? 0);
+      if (!Number.isFinite(throttle) || !Number.isFinite(steering)) {
+        const result = { ok: false, message: 'manual requires numeric throttle steering' };
+        logCommand(false, result.message, { action: 'manual' });
+        return result;
+      }
+      return withCommandLog(sendManualControl({ throttle, steering }), logCommand, { action: 'manual', throttle, steering });
+    }
+    if (verb === 'camera') {
+      return withCommandLog(triggerCameraRelay({}), logCommand, { action: 'cameraTrigger' });
+    }
+    if (verb === 'relay') {
+      const relay = sanitizeRelay(args[0]);
+      const enabled = args[1] === '1' || args[1]?.toLowerCase() === 'on' || args[1]?.toLowerCase() === 'high';
+      if (!state.online || !state.remote) {
+        const result = { ok: false, message: 'USV offline or remote endpoint unknown' };
+        logCommand(false, result.message, { action: 'relay', relay, enabled });
+        return result;
+      }
+      const frame = buildSetRelay(state.systemId, state.componentId || 1, relay, enabled);
+      udp.send(frame, state.remote.port, state.remote.address);
+      const message = `relay ${relay} ${enabled ? 'high' : 'low'} sent`;
+      logEventFromState('info', 'control', 'command_line', message, {
+        input,
+        action: 'relay',
+        relay,
+        enabled
+      }, 181, null, frame.toString('hex'));
+      broadcast('control.sent', { action: 'commandLine', command: input });
+      return { ok: true, message, data: { relay, enabled } };
+    }
+    if (verb === 'mavcmd') {
+      const command = Number(args[0]);
+      if (!Number.isInteger(command) || command < 0 || command > 65535) {
+        const result = { ok: false, message: 'mavcmd requires numeric command id' };
+        logCommand(false, result.message, { action: 'mavcmd' });
+        return result;
+      }
+      if (!state.online || !state.remote) {
+        const result = { ok: false, message: 'USV offline or remote endpoint unknown' };
+        logCommand(false, result.message, { action: 'mavcmd', command });
+        return result;
+      }
+      const params = args.slice(1, 8).map((value) => Number(value));
+      while (params.length < 7) params.push(0);
+      if (params.some((value) => !Number.isFinite(value))) {
+        const result = { ok: false, message: 'mavcmd params must be numeric' };
+        logCommand(false, result.message, { action: 'mavcmd', command });
+        return result;
+      }
+      const frame = buildCommandLongGeneric(state.systemId, state.componentId || 1, command, params);
+      udp.send(frame, state.remote.port, state.remote.address);
+      const message = `MAV_CMD ${command} sent`;
+      logEventFromState('info', 'control', 'command_line', message, {
+        input,
+        action: 'mavcmd',
+        command,
+        params
+      }, command, null, frame.toString('hex'));
+      broadcast('control.sent', { action: 'commandLine', command: input });
+      return { ok: true, message, data: { command, params } };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'command failed';
+    logCommand(false, message);
+    return { ok: false, message };
+  }
+
+  const message = 'unknown command. examples: arm, disarm, mode hold, manual 0.2 0, relay 0 1, mavcmd 179 0 0 0 0 31.1 121.1 0';
+  logCommand(false, message);
+  return { ok: false, message };
+}
+
+function withCommandLog(
+  result: { ok: boolean; message: string },
+  logCommand: (ok: boolean, message: string, details?: Record<string, unknown>) => void,
+  details: Record<string, unknown>
+): { ok: boolean; message: string; data?: Record<string, unknown> } {
+  logCommand(result.ok, result.message, details);
+  if (result.ok) broadcast('control.sent', { action: 'commandLine', ...details });
+  return { ...result, data: details };
+}
+
+function requestManualCaptureReupload(input: unknown): {
+  ok: boolean;
+  message: string;
+  data?: { deviceId: string; captureDate: string; pointIndex: number; missing: number[] };
+} {
+  const payload = input as Partial<{
+    deviceId: string;
+    captureDate: string;
+    pointIndex: number;
+    photoIndex: number;
+    missing: number[];
+  }>;
+  const deviceId = String(payload.deviceId || store.getState().deviceId || '').trim();
+  const captureDate = String(payload.captureDate || '').trim();
+  const pointIndex = sanitizePositiveInt(payload.pointIndex, 0);
+  const missing = Array.isArray(payload.missing)
+    ? payload.missing.map((item) => sanitizePositiveInt(item, 0)).filter((item) => item > 0)
+    : [sanitizePositiveInt(payload.photoIndex, 0)].filter((item) => item > 0);
+
+  if (!deviceId) return { ok: false, message: 'deviceId missing' };
+  if (!/^\d{8}$/.test(captureDate)) return { ok: false, message: 'captureDate must be YYYYMMDD' };
+  if (pointIndex <= 0) return { ok: false, message: 'pointIndex missing or invalid' };
+  if (missing.length === 0) return { ok: false, message: 'photoIndex or missing required' };
+  if (piClients.size === 0) return { ok: false, message: 'Raspberry Pi offline' };
+
+  const command = {
+    deviceId,
+    captureDate,
+    pointIndex,
+    missing: [...new Set(missing)].sort((a, b) => a - b)
+  };
+  broadcastPi('capture.reupload', command);
+  logEventFromState('warn', 'capture', 'reupload_manual', `Manual capture reupload requested point=${pointIndex}`, command);
+  return {
+    ok: true,
+    message: 'capture reupload requested',
+    data: command
+  };
+}
+
+function triggerCameraRelay(input: unknown): { ok: boolean; message: string; data?: { relay: number; pulseSeconds: number } } {
+  const now = Date.now();
+  if (now - lastCameraTriggerAt < CAMERA_TRIGGER_COOLDOWN_MS) {
+    const remainingSeconds = Math.ceil((CAMERA_TRIGGER_COOLDOWN_MS - (now - lastCameraTriggerAt)) / 1000);
+    return { ok: false, message: `camera trigger cooldown ${remainingSeconds}s` };
+  }
+
+  const payload = input as { relay?: number; pulseSeconds?: number };
+  const relay = sanitizeRelay(payload.relay ?? CAPTURE_AUX_RELAY);
+  const pulseSeconds = sanitizePulseSeconds(payload.pulseSeconds ?? CAPTURE_AUX_PULSE_SECONDS);
+  const state = store.getState();
+  if (!state.online || !state.remote) return { ok: false, message: 'USV offline or remote endpoint unknown' };
+
+  const targetComponent = state.componentId || 1;
+  const highFrame = buildSetRelay(state.systemId, targetComponent, relay, true);
+  lastCameraTriggerAt = now;
+  udp.send(highFrame, state.remote.port, state.remote.address);
+  logEventFromState('info', 'capture', 'manual_trigger_high', `Camera trigger relay ${relay} high`, {
+    relay,
+    pulseSeconds,
+    target: `${state.systemId}/${targetComponent}`
+  }, 181, null, highFrame.toString('hex'));
+  broadcast('control.sent', { action: 'cameraTrigger', relay, pulseSeconds });
+
+  setTimeout(() => {
+    const latest = store.getState();
+    if (!latest.remote) {
+      logEventFromState('warn', 'capture', 'manual_trigger_low', `Camera trigger relay ${relay} low skipped: remote unknown`, {
+        relay,
+        pulseSeconds
+      }, 181);
+      return;
+    }
+    const lowFrame = buildSetRelay(latest.systemId || state.systemId, latest.componentId || targetComponent, relay, false);
+    udp.send(lowFrame, latest.remote.port, latest.remote.address);
+    logEventFromState('info', 'capture', 'manual_trigger_low', `Camera trigger relay ${relay} low`, {
+      relay,
+      pulseSeconds,
+      target: `${latest.systemId || state.systemId}/${latest.componentId || targetComponent}`
+    }, 181, null, lowFrame.toString('hex'));
+    broadcast('control.sent', { action: 'cameraTriggerLow', relay });
+  }, Math.round(pulseSeconds * 1000));
+
+  return {
+    ok: true,
+    message: 'camera trigger relay pulse sent',
+    data: { relay, pulseSeconds }
+  };
 }
 
 function sampleTelemetry(): void {
@@ -1546,6 +2794,7 @@ function publicState(): Omit<UsvState, 'remote'> & {
   mission: ReturnType<typeof store.getMissionState>;
   home: HomeState;
   returnHome: ReturnHomeState;
+  capture: { missionId: string | null; captureDate?: string | null; deviceId?: string | null; points: CapturePointStatus[] };
 } {
   const { remote, ...state } = store.getState();
   return {
@@ -1554,7 +2803,8 @@ function publicState(): Omit<UsvState, 'remote'> & {
     udpPort: UDP_PORT,
     mission: store.getMissionState(),
     home: publicHomeState(),
-    returnHome: publicReturnHomeState()
+    returnHome: publicReturnHomeState(),
+    capture: captureStore.getCurrentCapture()
   };
 }
 
@@ -1569,6 +2819,34 @@ function publicReturnHomeState(): ReturnHomeState {
   return { ...returnHomeState };
 }
 
+function publicPiStatus(deviceId?: string | null): {
+  online: boolean;
+  connectionCount: number;
+  clients: PiClientState[];
+  lastOutbound: { type: string; sentAt: string; data: unknown } | null;
+} {
+  const matchingClients = [...piClients.values()]
+    .filter((client) => !deviceId || client.deviceId === deviceId || client.deviceId === null)
+    .sort((a, b) => Date.parse(b.lastMessageAt ?? b.connectedAt) - Date.parse(a.lastMessageAt ?? a.connectedAt));
+  return {
+    online: matchingClients.length > 0,
+    connectionCount: matchingClients.length,
+    clients: matchingClients,
+    lastOutbound: lastPiOutbound
+  };
+}
+
+function updatePiClient(ws: WebSocket, type: string, patch: Partial<PiClientState> = {}): void {
+  const current = piClients.get(ws);
+  if (!current) return;
+  piClients.set(ws, {
+    ...current,
+    ...patch,
+    lastMessageType: type,
+    lastMessageAt: new Date().toISOString()
+  });
+}
+
 function broadcastState(): void {
   broadcast('usv.telemetry', publicState());
 }
@@ -1577,16 +2855,65 @@ function broadcast(type: string, data: unknown): void {
   for (const client of clients) sendWs(client, type, data);
 }
 
+function broadcastPi(type: string, data: unknown): void {
+  lastPiOutbound = { type, sentAt: new Date().toISOString(), data };
+  for (const client of piClients.keys()) sendWs(client, type, data);
+}
+
 function sendWs(ws: WebSocket, type: string, data: unknown): void {
   if (ws.readyState !== ws.OPEN) return;
   ws.send(JSON.stringify({ type, timestamp: new Date().toISOString(), data }));
 }
 
 async function readBody(req: http.IncomingMessage): Promise<unknown> {
+  const raw = await readRawBody(req);
+  if (raw.length === 0) return {};
+  return JSON.parse(raw.toString('utf8'));
+}
+
+async function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
-  if (chunks.length === 0) return {};
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  return Buffer.concat(chunks);
+}
+
+type MultipartPart = {
+  name: string;
+  filename?: string;
+  contentType?: string;
+  data: Buffer;
+};
+
+function parseMultipart(body: Buffer, boundary: string): MultipartPart[] {
+  const delimiter = Buffer.from(`--${boundary}`);
+  const parts: MultipartPart[] = [];
+  let cursor = body.indexOf(delimiter);
+  while (cursor >= 0) {
+    cursor += delimiter.length;
+    if (body[cursor] === 45 && body[cursor + 1] === 45) break;
+    if (body[cursor] === 13 && body[cursor + 1] === 10) cursor += 2;
+    const headerEnd = body.indexOf(Buffer.from('\r\n\r\n'), cursor);
+    if (headerEnd < 0) break;
+    const headerText = body.subarray(cursor, headerEnd).toString('utf8');
+    const next = body.indexOf(delimiter, headerEnd + 4);
+    if (next < 0) break;
+    let data = body.subarray(headerEnd + 4, next);
+    if (data.length >= 2 && data[data.length - 2] === 13 && data[data.length - 1] === 10) {
+      data = data.subarray(0, data.length - 2);
+    }
+    const disposition = headerText.match(/content-disposition:[^\r\n]+/i)?.[0] ?? '';
+    const name = disposition.match(/name="([^"]+)"/)?.[1];
+    if (name) {
+      parts.push({
+        name,
+        filename: disposition.match(/filename="([^"]*)"/)?.[1] || undefined,
+        contentType: headerText.match(/content-type:\s*([^\r\n]+)/i)?.[1]?.trim(),
+        data
+      });
+    }
+    cursor = next;
+  }
+  return parts;
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
@@ -1615,6 +2942,7 @@ function eventQueryFromUrl(url: URL) {
     level: url.searchParams.get('level'),
     category: url.searchParams.get('category'),
     type: url.searchParams.get('type'),
+    q: url.searchParams.get('q'),
     limit: numberParam(url, 'limit'),
     cursor: numberParam(url, 'cursor')
   };
