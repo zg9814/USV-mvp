@@ -80,7 +80,8 @@ const LOG_RAW_MAVLINK = process.env.LOG_RAW_MAVLINK === '1';
 const EVENT_DB_PATH = process.env.EVENT_DB_PATH ?? 'data/usv-events.sqlite';
 const EVENT_LOG_RETENTION_DAYS = Number(process.env.EVENT_LOG_RETENTION_DAYS ?? 30);
 const OUTFALL_MODEL_PATH = process.env.OUTFALL_MODEL_PATH ?? 'models/outfall_yolov8s.pt';
-const OUTFALL_CONFIDENCE = Number(process.env.OUTFALL_CONFIDENCE ?? 0.25);
+const OUTFALL_CONFIDENCE = Number(process.env.OUTFALL_CONFIDENCE ?? 0.35);
+const OUTFALL_IOU = Number(process.env.OUTFALL_IOU ?? 0.45);
 let aiDetectionEnabled = process.env.OUTFALL_DETECTION_ENABLED !== 'false';
 const OUTFALL_DETECTION_PYTHON = process.env.OUTFALL_DETECTION_PYTHON ?? 'python3';
 const OUTFALL_DETECTION_SCRIPT = process.env.OUTFALL_DETECTION_SCRIPT ?? 'server/scripts/outfall_detect.py';
@@ -2189,15 +2190,16 @@ function handleControl(body: unknown): { ok: boolean; message: string } {
   return { ok: false, message: 'unknown action' };
 }
 
-function publicDetectionSettings(): { enabled: boolean; modelPath: string; confidence: number } {
+function publicDetectionSettings(): { enabled: boolean; modelPath: string; confidence: number; iou: number } {
   return {
     enabled: aiDetectionEnabled,
     modelPath: OUTFALL_MODEL_PATH,
-    confidence: OUTFALL_CONFIDENCE
+    confidence: OUTFALL_CONFIDENCE,
+    iou: OUTFALL_IOU
   };
 }
 
-function updateDetectionSettings(input: unknown): { ok: boolean; message: string; data: { enabled: boolean; modelPath: string; confidence: number } } {
+function updateDetectionSettings(input: unknown): { ok: boolean; message: string; data: { enabled: boolean; modelPath: string; confidence: number; iou: number } } {
   const payload = input as { enabled?: unknown };
   if (typeof payload.enabled !== 'boolean') {
     return {
@@ -2285,7 +2287,8 @@ async function runCaptureDetection(imageId: number): Promise<void> {
       modelPath: resolve(OUTFALL_MODEL_PATH),
       imagePath: image.file_path,
       annotatedPath,
-      confidence: OUTFALL_CONFIDENCE
+      confidence: OUTFALL_CONFIDENCE,
+      iou: OUTFALL_IOU
     });
     const detectionsJson = JSON.stringify(result.detections ?? []);
     const detection = captureStore.markDetectionComplete({
@@ -2336,6 +2339,7 @@ function runOutfallDetector(input: {
   imagePath: string;
   annotatedPath: string;
   confidence: number;
+  iou: number;
 }): Promise<OutfallDetectorResult> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(OUTFALL_DETECTION_PYTHON, [
@@ -2347,7 +2351,9 @@ function runOutfallDetector(input: {
       '--output',
       input.annotatedPath,
       '--conf',
-      String(input.confidence)
+      String(input.confidence),
+      '--iou',
+      String(input.iou)
     ], {
       cwd: process.cwd(),
       windowsHide: true

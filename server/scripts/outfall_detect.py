@@ -14,7 +14,8 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--conf", type=float, default=0.35)
+    parser.add_argument("--iou", type=float, default=0.45)
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -24,7 +25,7 @@ def main() -> None:
 
     started = time.perf_counter()
     model = YOLO(str(model_path))
-    results = model.predict(source=str(image_path), conf=args.conf, device=device, verbose=False)
+    results = model.predict(source=str(image_path), conf=args.conf, iou=args.iou, device=device, verbose=False)
     inference_ms = (time.perf_counter() - started) * 1000
 
     result = results[0]
