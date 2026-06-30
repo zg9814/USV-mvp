@@ -1,6 +1,7 @@
 import dgram from 'node:dgram';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import type { Duplex } from 'node:stream';
 import { access, readFile, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
@@ -58,6 +59,7 @@ const OFFLINE_AFTER_MS = Number(process.env.OFFLINE_AFTER_MS ?? 5000);
 const CONTROL_TIMEOUT_MS = Number(process.env.CONTROL_TIMEOUT_MS ?? 500);
 const REBOOT_DISARM_WAIT_MS = Number(process.env.REBOOT_DISARM_WAIT_MS ?? 3000);
 const REBOOT_DISARM_POLL_MS = Number(process.env.REBOOT_DISARM_POLL_MS ?? 100);
+const WS_STATE_BROADCAST_INTERVAL_MS = Number(process.env.WS_STATE_BROADCAST_INTERVAL_MS ?? 1000);
 const COMM_LOG_INTERVAL_MS = Number(process.env.COMM_LOG_INTERVAL_MS ?? 1000);
 const COMM_TELEMETRY_LOG_INTERVAL_MS = Number(process.env.COMM_TELEMETRY_LOG_INTERVAL_MS ?? 10000);
 const COMM_LOW_VOLTAGE = Number(process.env.COMM_LOW_VOLTAGE ?? 20);
@@ -85,6 +87,8 @@ const OUTFALL_IOU = Number(process.env.OUTFALL_IOU ?? 0.45);
 let aiDetectionEnabled = process.env.OUTFALL_DETECTION_ENABLED !== 'false';
 const OUTFALL_DETECTION_PYTHON = process.env.OUTFALL_DETECTION_PYTHON ?? 'python3';
 const OUTFALL_DETECTION_SCRIPT = process.env.OUTFALL_DETECTION_SCRIPT ?? 'server/scripts/outfall_detect.py';
+const PI_PROXY_TARGET = process.env.PI_PROXY_TARGET ?? '';
+const piProxyTarget = PI_PROXY_TARGET ? new URL(PI_PROXY_TARGET) : null;
 
 const store = new UsvStore(OFFLINE_AFTER_MS);
 const eventLog = new EventLogStore(EVENT_DB_PATH, EVENT_LOG_RETENTION_DAYS);
@@ -111,6 +115,7 @@ let lastPiOutbound: { type: string; sentAt: string; data: unknown } | null = nul
 
 let lastManualInputAt = 0;
 let lastSentZeroAt = 0;
+let lastStateBroadcastAt = 0;
 let missionUploadInProgress = false;
 let pendingMissionItems: MissionItem[] = [];
 let lastUploadMissionItems: MissionItem[] = [];
@@ -1664,12 +1669,16 @@ function requestMissionReadback(reason: string): { ok: boolean; message: string 
 }
 
 async function handleCaptureUpload(req: http.IncomingMessage): Promise<{ ok: boolean; status: number; body: unknown }> {
-  const contentTypeHeader = req.headers['content-type'] ?? '';
+  return handleCaptureUploadBody(req.headers, await readRawBody(req));
+}
+
+async function handleCaptureUploadBody(headers: http.IncomingHttpHeaders, body: Buffer): Promise<{ ok: boolean; status: number; body: unknown }> {
+  const contentTypeHeader = headers['content-type'] ?? '';
   const boundary = String(contentTypeHeader).match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[1]
     ?? String(contentTypeHeader).match(/boundary=(?:"([^"]+)"|([^;]+))/)?.[2];
   if (!boundary) return { ok: false, status: 400, body: { code: 400, message: 'multipart boundary missing' } };
 
-  const parts = parseMultipart(await readRawBody(req), boundary);
+  const parts = parseMultipart(body, boundary);
   const field = (name: string) => parts.find((part) => part.name === name && !part.filename)?.data.toString('utf8').trim() ?? '';
   const file = parts.find((part) => part.filename);
   if (!file) return { ok: false, status: 400, body: { code: 400, message: 'image file missing' } };
@@ -1821,6 +1830,10 @@ setInterval(runCaptureCompletenessChecks, 30_000);
 const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
+  if (piProxyTarget && shouldProxyPiHttp(url)) {
+    return proxyPiHttp(req, res, url);
+  }
+
   if (url.pathname === '/api/state') {
     return sendJson(res, 200, { code: 200, data: publicState() });
   }
@@ -1889,7 +1902,11 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/api/captures/upload' && req.method === 'POST') {
-    const result = await handleCaptureUpload(req);
+    const body = await readRawBody(req);
+    const result = await handleCaptureUploadBody(req.headers, body);
+    if (result.ok && piProxyTarget) {
+      void forwardCaptureUploadToPiTarget(req, url, body);
+    }
     return sendJson(res, result.status, result.body);
   }
 
@@ -1993,6 +2010,7 @@ const piWss = new WebSocketServer({ noServer: true });
 
 httpServer.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
   const target = url.pathname === '/ws'
     ? wss
     : url.pathname === '/api/pi/ws'
@@ -2853,7 +2871,10 @@ function updatePiClient(ws: WebSocket, type: string, patch: Partial<PiClientStat
   });
 }
 
-function broadcastState(): void {
+function broadcastState(force = false): void {
+  const now = Date.now();
+  if (!force && now - lastStateBroadcastAt < WS_STATE_BROADCAST_INTERVAL_MS) return;
+  lastStateBroadcastAt = now;
   broadcast('usv.telemetry', publicState());
 }
 
@@ -2869,6 +2890,131 @@ function broadcastPi(type: string, data: unknown): void {
 function sendWs(ws: WebSocket, type: string, data: unknown): void {
   if (ws.readyState !== ws.OPEN) return;
   ws.send(JSON.stringify({ type, timestamp: new Date().toISOString(), data }));
+}
+
+function shouldProxyPiHttp(url: URL): boolean {
+  void url;
+  return false;
+}
+
+async function forwardCaptureUploadToPiTarget(req: http.IncomingMessage, url: URL, body: Buffer): Promise<void> {
+  if (!piProxyTarget) return;
+
+  const headers = { ...req.headers };
+  headers.host = piProxyTarget.host;
+  headers['content-length'] = String(body.length);
+
+  await new Promise<void>((resolvePromise) => {
+    const proxyReq = http.request({
+      protocol: piProxyTarget.protocol,
+      hostname: piProxyTarget.hostname,
+      port: piProxyTarget.port,
+      method: req.method,
+      path: `${url.pathname}${url.search}`,
+      headers
+    }, (proxyRes) => {
+      proxyRes.resume();
+      proxyRes.on('end', () => {
+        if ((proxyRes.statusCode ?? 500) >= 400) {
+          logEventFromState('warn', 'capture', 'upload_forward_failed', `Capture upload forward failed status=${proxyRes.statusCode}`, {
+            target: PI_PROXY_TARGET,
+            statusCode: proxyRes.statusCode
+          });
+        }
+        resolvePromise();
+      });
+    });
+
+    proxyReq.on('error', (error) => {
+      console.warn('PI upload forward failed:', error.message);
+      logEventFromState('warn', 'capture', 'upload_forward_failed', 'Capture upload forward failed', {
+        target: PI_PROXY_TARGET,
+        error: error.message
+      });
+      resolvePromise();
+    });
+
+    proxyReq.end(body);
+  });
+}
+
+function proxyPiHttp(req: http.IncomingMessage, res: http.ServerResponse, url: URL): void {
+  if (!piProxyTarget) {
+    sendJson(res, 502, { code: 502, message: 'pi proxy target not configured' });
+    return;
+  }
+
+  const headers = { ...req.headers };
+  headers.host = piProxyTarget.host;
+
+  const proxyReq = http.request({
+    protocol: piProxyTarget.protocol,
+    hostname: piProxyTarget.hostname,
+    port: piProxyTarget.port,
+    method: req.method,
+    path: `${url.pathname}${url.search}`,
+    headers
+  }, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (error) => {
+    console.warn('PI HTTP proxy failed:', error.message);
+    if (!res.headersSent) {
+      sendJson(res, 502, { code: 502, message: 'pi proxy failed' });
+    } else {
+      res.destroy(error);
+    }
+  });
+
+  req.pipe(proxyReq);
+}
+
+function proxyPiWebSocket(req: http.IncomingMessage, socket: Duplex, head: Buffer, url: URL): void {
+  if (!piProxyTarget) {
+    socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const headers = { ...req.headers };
+  headers.host = piProxyTarget.host;
+
+  const proxyReq = http.request({
+    protocol: piProxyTarget.protocol,
+    hostname: piProxyTarget.hostname,
+    port: piProxyTarget.port,
+    method: req.method,
+    path: `${url.pathname}${url.search}`,
+    headers
+  });
+
+  proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+    socket.write([
+      `HTTP/${proxyRes.httpVersion} ${proxyRes.statusCode} ${proxyRes.statusMessage}`,
+      ...Object.entries(proxyRes.headers).flatMap(([key, value]) => {
+        if (value == null) return [];
+        return Array.isArray(value)
+          ? value.map((item) => `${key}: ${item}`)
+          : [`${key}: ${value}`];
+      }),
+      '',
+      ''
+    ].join('\r\n'));
+    if (proxyHead.length > 0) socket.write(proxyHead);
+    if (head.length > 0) proxySocket.write(head);
+    proxySocket.pipe(socket);
+    socket.pipe(proxySocket);
+  });
+
+  proxyReq.on('error', (error) => {
+    console.warn('PI WebSocket proxy failed:', error.message);
+    socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    socket.destroy();
+  });
+
+  proxyReq.end();
 }
 
 async function readBody(req: http.IncomingMessage): Promise<unknown> {
