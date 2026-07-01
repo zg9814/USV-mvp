@@ -29,9 +29,9 @@ Upload:    http://127.0.0.1:4100/api/captures/upload
 云端生产环境示例：
 
 ```text
-HTTP:      http://121.40.86.143:4100
-Pi WS:     ws://121.40.86.143:4100/api/pi/ws
-Upload:    http://121.40.86.143:4100/api/captures/upload
+HTTP:      http://123.207.218.215:4100
+Pi WS:     ws://123.207.218.215:4100/api/pi/ws
+Upload:    http://123.207.218.215:4100/api/captures/upload
 ```
 
 目前第一版没有用户认证，树莓派可以直接连接以上接口。后续若增加认证，会另行补充 token 或签名字段。
@@ -60,10 +60,20 @@ deviceId + captureDate + pointIndex + photoIndex
 
 ## 4. 飞控 AUX 触发
 
-拍照航点在飞控任务中会生成两类任务项：
+拍照航点在飞控任务中会生成以下任务项：
 
 1. `NAV_WAYPOINT`，包含 `waitSeconds`，用于让船在拍照点附近停留。
-2. `MAV_CMD_DO_SET_RELAY = 181`，用于触发 AUX/继电器输出，通知树莓派开始拍照。
+2. `MAV_CMD_DO_SET_RELAY = 181`，`param1=relay`、`param2=1`，将 Relay/AUX 拉高。
+3. `MAV_CMD_CONDITION_DELAY = 112`，延迟 `CAPTURE_AUX_PULSE_SECONDS` 秒。
+4. `MAV_CMD_DO_SET_RELAY = 181`，`param1=relay`、`param2=0`，将 Relay/AUX 拉低。
+
+因此自动航线拍照点和前端“触发拍摄”测试按钮现在都使用“拉高 -> 延迟 -> 拉低”的脉冲语义。事件日志中可看到：
+
+```text
+MISSION_AUX_CAPTURE_HIGH
+MISSION_AUX_CAPTURE_DELAY
+MISSION_AUX_CAPTURE_LOW
+```
 
 当前默认参数：
 
@@ -74,7 +84,7 @@ deviceId + captureDate + pointIndex + photoIndex
 
 嵌入式侧建议将 AUX/继电器信号作为“开始拍摄当前点位”的边沿触发信号处理。树莓派不应依赖云端实时确认后再拍摄。
 
-注意：不同 ArduPilot 版本对 `MAV_CMD_DO_SET_RELAY` 的脉冲参数支持可能不同。若联调时发现输出只拉高不自动拉低，可以改为边沿检测、硬件单稳态，或后续由云端改用更明确的 relay repeat/pulse 命令。
+注意：不同 ArduPilot 版本对 mission 中的 `CONDITION_DELAY` 和后续 DO 命令执行顺序可能存在差异。若手动“触发拍摄”正常而自动航线仍不能触发，应同时检查飞控任务 readback 是否包含 `HIGH/DELAY/LOW` 三段、AUTO 任务是否执行到该拍照点、以及实际 AUX/Relay 口是否有电平变化。
 
 ## 5. 树莓派 WebSocket 协议
 
@@ -303,7 +313,7 @@ Content-Type: multipart/form-data
 示例：
 
 ```bash
-curl -X POST "http://121.40.86.143:4100/api/captures/upload" \
+curl -X POST "http://123.207.218.215:4100/api/captures/upload" \
   -F "deviceId=usv-001" \
   -F "captureDate=20260616" \
   -F "pointIndex=1" \
@@ -341,6 +351,31 @@ curl -X POST "http://121.40.86.143:4100/api/captures/upload" \
 同一个 `deviceId + captureDate + pointIndex + photoIndex` 重复上传时，云端会覆盖该序号对应的图片元数据和文件路径。
 
 为了便于摄像头单独联调，云端不会因为没有预先创建拍摄计划而拒绝照片。没有对应点位时会自动创建 `expectedPhotoCount=10`、`captureStepDeg=36`、`status=receiving` 的点位记录并保存原图。
+
+生产环境中，`4100` 上的 USV 云端会先保存照片、入库、触发 AI 识别，然后将同一份 multipart 上传请求转发到 `127.0.0.1:8088/api/captures/upload`。树莓派只需要上传到 `123.207.218.215:4100`，不要直接连 `8088`。
+
+## 6.1 AI 识别
+
+云端收到照片后会根据“AI 识别过滤”开关决定是否自动排队识别排口：
+
+- 开启：保存原图后创建识别任务，使用云端模型进行 CPU 推理。
+- 关闭：只保存原图和元数据，不创建识别任务。
+
+当前生产模型：
+
+```text
+/opt/usv-cloud-mvp/models/outfall_yolov8s.pt
+```
+
+当前生产参数：
+
+```text
+confidence = 0.50
+iou = 0.45
+device = cpu
+```
+
+树莓派不需要调用模型接口，只需要上传照片。
 
 ## 7. 查询接口
 
@@ -504,7 +539,9 @@ angleDeg = (photoIndex - 1) * captureStepDeg
 
 ### 11.2 AUX 触发
 
-- 拍照航点到达后，树莓派能检测到飞控 AUX/relay 触发。
+- 手动“触发拍摄”时，树莓派能检测到约 `CAPTURE_AUX_PULSE_SECONDS` 秒的高电平脉冲。
+- 拍照航点到达后，树莓派也能检测到飞控 AUX/relay 脉冲。
+- 事件日志中自动任务应出现 `MISSION_AUX_CAPTURE_HIGH`、`MISSION_AUX_CAPTURE_DELAY`、`MISSION_AUX_CAPTURE_LOW`。
 - 单次触发只启动一次该点拍摄。
 - 抖动或重复电平不会导致重复拍摄同一个点位。
 
@@ -541,7 +578,6 @@ angleDeg = (photoIndex - 1) * captureStepDeg
 ## 12. 第一版暂不包含
 
 - 图片水印。
-- AI 识别。
 - 报告导出。
 - 对象存储。
 - 多船多用户认证隔离。
@@ -553,7 +589,7 @@ angleDeg = (photoIndex - 1) * captureStepDeg
    树莓派只收到 AUX 触发信号，本身不知道飞控当前航点序号。第一版建议按触发次数匹配拍摄计划：第 1 次 AUX 对应 `capturePointIndex=1`，第 2 次对应 `2`。如果后续需要更强校验，可以让树莓派同时监听 MAVLink `MISSION_CURRENT`。
 
 2. Relay 脉冲兼容性  
-   如果飞控输出不是稳定的短脉冲，嵌入式侧应做边沿检测和防抖。必要时云端后续调整 MAVLink 命令。
+   云端自动任务已经生成 `HIGH -> DELAY -> LOW` 三段任务项，但实际输出仍取决于飞控参数、AUX/Relay 映射和 AUTO mission 对 DO/CONDITION 命令的支持。嵌入式侧仍应做边沿检测和防抖。
 
 3. 时间同步  
    `takenAt` 建议使用 UTC ISO 时间。树莓派应开启 NTP 或从网络时间校准。

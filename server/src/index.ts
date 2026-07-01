@@ -1092,21 +1092,26 @@ function handleMissionRequest(targetSystem: number, targetComponent: number, seq
   if (sequence < pendingMissionItems.length) {
     const item = pendingMissionItems[sequence];
     const waitSeconds = item.type === 'waypoint' ? sanitizeWaitSeconds(item.waitSeconds) : 0;
+    const auxAction = item.type === 'aux' ? item.action ?? 'high' : null;
     const frame = item.type === 'doJump'
       ? buildMissionDoJumpInt(targetSystem, targetComponent, sequence, item.target, item.repeat)
       : item.type === 'aux'
-        ? buildMissionCommandInt(targetSystem, targetComponent, sequence, 181, [item.relay, 1, item.pulseSeconds])
+        ? auxAction === 'delay'
+          ? buildMissionCommandInt(targetSystem, targetComponent, sequence, 112, [item.pulseSeconds])
+          : buildMissionCommandInt(targetSystem, targetComponent, sequence, 181, [item.relay, auxAction === 'low' ? 0 : 1])
         : buildMissionItemInt(targetSystem, targetComponent, sequence, item.lat, item.lng, item.altitude ?? 0, 16, item.type === 'home' ? 0 : 6, waitSeconds);
     const label = item.type === 'doJump'
       ? `MISSION_DO_JUMP_INT seq=${sequence}`
       : item.type === 'aux'
-        ? `MISSION_AUX_CAPTURE seq=${sequence} capturePoint=${item.capturePointIndex} relay=${item.relay}`
+        ? auxAction === 'delay'
+          ? `MISSION_AUX_CAPTURE_DELAY seq=${sequence} capturePoint=${item.capturePointIndex} seconds=${item.pulseSeconds}`
+          : `MISSION_AUX_CAPTURE_${auxAction === 'low' ? 'LOW' : 'HIGH'} seq=${sequence} capturePoint=${item.capturePointIndex} relay=${item.relay}`
         : `MISSION_ITEM_INT seq=${sequence} hold=${waitSeconds}s`;
     sendMissionFrame(frame, label);
     console.log(item.type === 'doJump'
       ? `Sent DO_JUMP ${sequence}: target=${item.target} repeat=${item.repeat}`
       : item.type === 'aux'
-        ? `Sent AUX capture ${sequence}: point=${item.capturePointIndex} relay=${item.relay} pulse=${item.pulseSeconds}s`
+        ? `Sent AUX capture ${sequence}: point=${item.capturePointIndex} action=${auxAction} relay=${item.relay} pulse=${item.pulseSeconds}s`
         : `Sent waypoint ${sequence} as MISSION_ITEM_INT: ${item.lat}, ${item.lng}, hold=${waitSeconds}s`);
   }
 }
@@ -1278,8 +1283,15 @@ function missionItemsMatchReadback(expected: MissionItem[], actual: ParsedMissio
       continue;
     }
     if (expectedItem.type === 'aux') {
+      const action = expectedItem.action ?? 'high';
+      if (action === 'delay') {
+        if (actualItem.command !== 112) return false;
+        if (Math.abs(actualItem.param1 - expectedItem.pulseSeconds) > 0.1) return false;
+        continue;
+      }
       if (actualItem.command !== 181) return false;
       if (Math.round(actualItem.param1) !== expectedItem.relay) return false;
+      if (Math.round(actualItem.param2) !== (action === 'low' ? 0 : 1)) return false;
       continue;
     }
     if (actualItem.command !== 16) return false;
@@ -1434,7 +1446,24 @@ function buildMissionItems(waypoints: Waypoint[], loopCount: number, state: UsvS
         order: items.length,
         capturePointIndex,
         relay: sanitizeRelay(CAPTURE_AUX_RELAY),
-        pulseSeconds: sanitizePulseSeconds(CAPTURE_AUX_PULSE_SECONDS)
+        pulseSeconds: sanitizePulseSeconds(CAPTURE_AUX_PULSE_SECONDS),
+        action: 'high'
+      });
+      items.push({
+        type: 'aux',
+        order: items.length,
+        capturePointIndex,
+        relay: sanitizeRelay(CAPTURE_AUX_RELAY),
+        pulseSeconds: sanitizePulseSeconds(CAPTURE_AUX_PULSE_SECONDS),
+        action: 'delay'
+      });
+      items.push({
+        type: 'aux',
+        order: items.length,
+        capturePointIndex,
+        relay: sanitizeRelay(CAPTURE_AUX_RELAY),
+        pulseSeconds: sanitizePulseSeconds(CAPTURE_AUX_PULSE_SECONDS),
+        action: 'low'
       });
     }
   }

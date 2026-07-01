@@ -119,8 +119,17 @@ curl -I "http://127.0.0.1:4100/api/logs/export.csv?kind=events"
 1. 将一个航点设为拍照点。
 2. 默认等待时间为 60 秒。
 3. 上传任务后生成 `missionId`。
-4. 飞控任务中该点后追加 AUX relay 触发项。
+4. 飞控任务中该点后追加 Relay/AUX 三段脉冲任务。
 5. 事件日志出现 `capture/plan_ready`。
+6. 事件日志出现：
+
+```text
+MISSION_AUX_CAPTURE_HIGH
+MISSION_AUX_CAPTURE_DELAY
+MISSION_AUX_CAPTURE_LOW
+```
+
+7. 任务 readback 中应能读回 `command=181`、`command=112`、`command=181`。
 
 ## 低电压测试
 
@@ -150,7 +159,7 @@ curl -I "http://127.0.0.1:4100/api/logs/export.csv?kind=events"
 3. 打开前端“摄像头测试”页，确认“树莓派连接”显示在线、Pi ID 和最近心跳。
 4. 点击“创建测试拍摄计划”。
 5. 树莓派收到 `capture.plan`，或查询 `/api/capture-plan/current`。
-6. 用测试 `missionId` 模拟上传一张图片到 `/api/captures/upload`。
+6. 按 `deviceId + captureDate + pointIndex + photoIndex` 模拟上传一张图片到 `/api/captures/upload`。
 7. 前端 10 格验收区显示已收数量。
 8. 故意漏传图片。
 9. 等待云端发送 `capture.reupload`。
@@ -164,6 +173,25 @@ curl -I "http://127.0.0.1:4100/api/logs/export.csv?kind=events"
 5. 树莓派检测到高电平后执行内部流程：电机转一圈并拍摄 10 张。
 6. 页面 10 格验收区显示照片逐步上传。
 7. 事件日志中应出现 `capture/manual_trigger_high` 和 `capture/manual_trigger_low`。
+
+自动航线触发拍照测试：
+
+1. 部署包含自动拍照修复的版本。
+2. 规划一个短航线，只设置 1 个拍照点。
+3. 拍照点等待时间设置为 60 秒。
+4. 上传任务，确认日志有 `MISSION_AUX_CAPTURE_HIGH/DELAY/LOW`。
+5. 开始任务，让船执行到拍照点。
+6. 用万用表、示波器或树莓派日志确认 Relay/AUX 出现高-低脉冲。
+7. 确认树莓派上传 10 张照片。
+8. 再规划 2 个拍照点，确认第二个点也能触发，避免 Relay 长时间保持高电平导致后续没有上升沿。
+
+AI 识别测试：
+
+1. 打开“摄像头测试”页，确认“AI 识别过滤”开启。
+2. 上传一组照片。
+3. 事件日志应出现 `capture/detection_queued` 和 `capture/detection_complete`。
+4. 前端可打开原图和识别结果图。
+5. 关闭“AI 识别过滤”后再次上传，照片应保存，但显示未启用识别，并记录 `capture/detection_skipped`。
 
 ## 部署验证
 

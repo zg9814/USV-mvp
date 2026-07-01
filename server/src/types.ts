@@ -64,6 +64,7 @@ export type MissionItem =
       capturePointIndex: number;
       relay: number;
       pulseSeconds: number;
+      action?: 'high' | 'delay' | 'low';
     };
 
 export type MissionState = {

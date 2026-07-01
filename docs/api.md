@@ -10,6 +10,14 @@ ws://127.0.0.1:4000/api/pi/ws
 
 生产云端常用端口为 `4100`。
 
+当前生产地址：
+
+```text
+http://123.207.218.215:4100
+ws://123.207.218.215:4100/ws
+ws://123.207.218.215:4100/api/pi/ws
+```
+
 所有 JSON HTTP 响应通常为：
 
 ```json
@@ -135,6 +143,22 @@ POST /api/mission/readback
 | `expectedPhotoCount` | 预计照片数量 |
 | `captureStepDeg` | 拍照角度步进 |
 
+拍照点上传到飞控任务后，会在拍照航点后追加三段 Relay/AUX 脉冲任务：
+
+```text
+MAV_CMD_DO_SET_RELAY=181 relay high
+MAV_CMD_CONDITION_DELAY=112 pulseSeconds
+MAV_CMD_DO_SET_RELAY=181 relay low
+```
+
+事件日志中对应：
+
+```text
+MISSION_AUX_CAPTURE_HIGH
+MISSION_AUX_CAPTURE_DELAY
+MISSION_AUX_CAPTURE_LOW
+```
+
 ### 事件日志
 
 ```text
@@ -233,6 +257,35 @@ POST /api/camera/trigger
 ```
 
 该接口向飞控发送 `MAV_CMD_DO_SET_RELAY=181` 高电平，并在指定秒数后自动拉低，仅用于摄像头链路测试。
+
+### AI 识别设置
+
+```text
+GET  /api/detections/settings
+POST /api/detections/settings
+POST /api/captures/:id/detect
+```
+
+查询识别设置返回当前开关、模型路径和阈值：
+
+```json
+{
+  "enabled": true,
+  "modelPath": "models/outfall_yolov8s.pt",
+  "confidence": 0.5,
+  "iou": 0.45
+}
+```
+
+切换识别过滤：
+
+```json
+{
+  "enabled": false
+}
+```
+
+照片上传接口始终保存原图。只有 `enabled=true` 时，云端才会为新上传照片创建排口识别任务。手动重跑识别在关闭状态下会返回 400。
 
 ## 浏览器 WebSocket
 

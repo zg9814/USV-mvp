@@ -55,6 +55,10 @@ data/usv-events.sqlite
 | `mission/upload_failed` | 航线上传失败 |
 | `capture/reupload_requested` | 云端要求树莓派补传 |
 | `capture/incomplete` | 多次补传后仍缺图 |
+| `capture/detection_queued` | 图片已进入排口识别队列 |
+| `capture/detection_complete` | 排口识别完成 |
+| `capture/detection_failed` | 排口识别失败 |
+| `capture/detection_skipped` | AI 识别过滤关闭，跳过识别 |
 
 ## Remote endpoint 变化
 
@@ -140,7 +144,59 @@ Home 保存在运行内存中，服务重启后清空。
 5. 图片上传后查看 `capture/image_uploaded`。
 6. 缺图时查看 `capture/reupload_requested`。
 
+自动航线拍照点当前应写入三段飞控任务：
+
+```text
+MISSION_AUX_CAPTURE_HIGH
+MISSION_AUX_CAPTURE_DELAY
+MISSION_AUX_CAPTURE_LOW
+```
+
+如果手动“触发拍摄”可以触发，但航线拍照不能触发，优先检查：
+
+- 上传任务日志是否包含以上三段。
+- 任务 readback 是否读回 `command=181` high、`command=112` delay、`command=181` low。
+- 飞控是否真的执行到拍照航点。
+- AUTO 任务中是否允许执行 `DO_SET_RELAY` 和 `CONDITION_DELAY`。
+- `CAPTURE_AUX_RELAY` 是否和树莓派实际接线一致，生产默认 `0`。
+- 用万用表或示波器确认 AUX/Relay 口是否出现约 1 秒高电平脉冲。
+
 `/api/captures/upload` 现在采用宽松接收策略，没有对应拍摄计划时会自动创建接收计划。若没有看到照片，优先检查 multipart 字段名是否包含 `file`，以及 PM2 日志中是否有上传解析错误。
+
+## AI 识别排障
+
+当前云端模型路径：
+
+```text
+/opt/usv-cloud-mvp/models/outfall_yolov8s.pt
+```
+
+当前生产推理环境：
+
+```text
+OUTFALL_DETECTION_PYTHON=/opt/usv-cloud-mvp/.venv/bin/python
+OUTFALL_CONFIDENCE=0.50
+OUTFALL_IOU=0.45
+```
+
+检查设置：
+
+```bash
+curl -i http://127.0.0.1:4100/api/detections/settings
+ls -lh /opt/usv-cloud-mvp/models/outfall_yolov8s.pt
+```
+
+常见问题：
+
+| 现象 | 排查 |
+| --- | --- |
+| 上传后没有识别任务 | 前端“AI 识别过滤”是否关闭；看 `capture/detection_skipped` |
+| 识别失败 | 看 PM2 日志、Python 路径、`cv2`/`ultralytics` 是否可导入 |
+| 识别图打不开 | 看 `data/captures/annotated/` 文件是否存在、路径是否入库 |
+| 漏检多 | 降低 `OUTFALL_CONFIDENCE` 或补充真实场景数据重新训练 |
+| 误检多 | 提高 `OUTFALL_CONFIDENCE` 或补充负样本重新训练 |
+
+服务器没有 CUDA 时不要安装 GPU 版推理依赖，使用 CPU 环境即可。
 
 ## PM2 日志
 

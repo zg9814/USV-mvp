@@ -40,7 +40,7 @@ npm start
 
 | 项 | 值 |
 | --- | --- |
-| 服务器 | `121.40.86.143` |
+| 服务器 | `123.207.218.215` |
 | 用户 | `root` |
 | 项目目录 | `/opt/usv-cloud-mvp` |
 | PM2 应用名 | `usv-cloud-mvp` |
@@ -50,13 +50,13 @@ npm start
 生产访问：
 
 ```text
-http://121.40.86.143:4100/
+http://123.207.218.215:4100/
 ```
 
 船端上报：
 
 ```text
-udp://121.40.86.143:14550
+udp://123.207.218.215:14550
 ```
 
 ## 环境变量
@@ -88,6 +88,12 @@ udp://121.40.86.143:14550
 | `CAPTURE_UPLOAD_CHECK_DELAY_SECONDS` | `180` | 缺图检查延迟 |
 | `CAPTURE_REUPLOAD_MAX_ATTEMPTS` | `3` | 最大补传请求次数 |
 | `CAMERA_TRIGGER_COOLDOWN_MS` | `5000` | 手动触发高电平最小间隔 |
+| `PI_PROXY_TARGET` | 空 | 上传照片双写目标；生产当前为 `http://127.0.0.1:8088` |
+| `OUTFALL_DETECTION_ENABLED` | `true` | 启动时 AI 识别过滤默认开关 |
+| `OUTFALL_DETECTION_MODEL` | `models/outfall_yolov8s.pt` | 排口识别模型路径 |
+| `OUTFALL_DETECTION_PYTHON` | 空 | 指定识别 Python，生产为 `/opt/usv-cloud-mvp/.venv/bin/python` |
+| `OUTFALL_CONFIDENCE` | `0.35` | 排口识别置信度阈值，生产当前为 `0.50` |
+| `OUTFALL_IOU` | `0.45` | 排口识别 IOU 阈值 |
 
 云端生产建议：
 
@@ -97,6 +103,17 @@ UDP_PORT=14550
 ```
 
 不额外设置 `EVENT_DB_PATH` 时，SQLite 默认保存到 `/opt/usv-cloud-mvp/data/usv-events.sqlite`。
+
+生产当前补充约定：
+
+```bash
+PI_PROXY_TARGET=http://127.0.0.1:8088
+OUTFALL_DETECTION_PYTHON=/opt/usv-cloud-mvp/.venv/bin/python
+OUTFALL_CONFIDENCE=0.50
+OUTFALL_IOU=0.45
+```
+
+树莓派仍只连接 `123.207.218.215:4100`。`/api/captures/upload` 在 4100 本地保存、入库和识别后，会额外转发同一份 multipart 到 `127.0.0.1:8088`。
 
 ## PM2 部署流程
 
@@ -149,13 +166,15 @@ pm2 logs usv-cloud-mvp --lines 80 --nostream
 curl -i http://127.0.0.1:4100/api/state
 curl -i "http://127.0.0.1:4100/api/logs/events?limit=5"
 curl -I "http://127.0.0.1:4100/api/logs/export.csv?kind=events"
+curl -i http://127.0.0.1:4100/api/detections/settings
 ls -lh /opt/usv-cloud-mvp/data/usv-events.sqlite
+ls -lh /opt/usv-cloud-mvp/models/outfall_yolov8s.pt
 ```
 
 前端验证：
 
 ```text
-http://121.40.86.143:4100/
+http://123.207.218.215:4100/
 ```
 
 确认：
@@ -165,6 +184,8 @@ http://121.40.86.143:4100/
 - Home 设置区正常。
 - 航线可设置等待时间和拍照点。
 - 拍摄记录区域可显示。
+- 摄像头测试页可显示树莓派在线状态、AI 识别过滤开关和拍摄记录。
+- 带拍照点任务上传后，事件日志应出现 `MISSION_AUX_CAPTURE_HIGH`、`MISSION_AUX_CAPTURE_DELAY`、`MISSION_AUX_CAPTURE_LOW`。
 
 ## 回滚
 

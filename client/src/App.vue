@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 
 type UsvState = {
   deviceId: string;
@@ -322,6 +322,7 @@ const lowVoltageAlarmActive = ref(false);
 const cameraTriggerLoading = ref(false);
 const cameraTriggerMessage = ref('');
 const cameraTriggerError = ref('');
+const captureDateFilter = ref(toDateInputValue(new Date()));
 const testPlanLoading = ref(false);
 const testPlanMessage = ref('');
 const testPlanError = ref('');
@@ -394,7 +395,7 @@ const displayLatLabel = computed(() => displayShipPoint.value ? displayShipPoint
 const routeLengthMeters = computed(() => calculateRouteLength(waypoints.value));
 const routeLengthLabel = computed(() => formatDistance(routeLengthMeters.value));
 const captureWaypointCount = computed(() => waypoints.value.filter((point) => point.captureEnabled).length);
-const missionUploadItemCount = computed(() => waypoints.value.length === 0 ? 0 : waypoints.value.length + 1 + captureWaypointCount.value + (missionLoopCount.value > 1 ? 1 : 0));
+const missionUploadItemCount = computed(() => waypoints.value.length === 0 ? 0 : waypoints.value.length + 1 + captureWaypointCount.value * 3 + (missionLoopCount.value > 1 ? 1 : 0));
 const captureMissionLabel = computed(() => {
   if (captureMission.captureDate) return `date=${captureMission.captureDate}`;
   return captureMission.missionId ? `mission=${captureMission.missionId}` : '--';
@@ -646,7 +647,16 @@ async function loadHome() {
 
 async function loadCaptureStatus(missionId?: string | null) {
   try {
-    const url = missionId ? `/api/captures?missionId=${encodeURIComponent(missionId)}` : '/api/captures';
+    const params = new URLSearchParams();
+    if (missionId) {
+      params.set('missionId', missionId);
+    } else {
+      const captureDate = dateInputToCaptureDate(captureDateFilter.value);
+      if (captureDate) params.set('captureDate', captureDate);
+      if (state.deviceId && state.deviceId !== 'USV-UNKNOWN') params.set('deviceId', state.deviceId);
+    }
+    const query = params.toString();
+    const url = query ? `/api/captures?${query}` : '/api/captures';
     const response = await fetch(url);
     const result = await response.json() as { data?: CaptureMission };
     if (result.data) applyCaptureMission(result.data);
@@ -701,6 +711,7 @@ async function toggleDetectionSettings() {
 function applyCaptureMission(data: unknown) {
   const payload = data as Partial<CaptureMission> & { plans?: unknown[] };
   if ('points' in payload) {
+    if (!shouldApplyCaptureMission(payload)) return;
     captureMission.missionId = payload.missionId ?? null;
     captureMission.captureDate = payload.captureDate ?? null;
     captureMission.deviceId = payload.deviceId ?? null;
@@ -713,6 +724,26 @@ function applyCaptureMission(data: unknown) {
     captureMission.deviceId = null;
     captureMission.points = [];
   }
+}
+
+function shouldApplyCaptureMission(payload: Partial<CaptureMission>) {
+  const selectedDate = dateInputToCaptureDate(captureDateFilter.value);
+  if (!selectedDate || !payload.captureDate) return true;
+  return payload.captureDate === selectedDate;
+}
+
+function refreshCaptureStatus() {
+  loadCaptureStatus();
+}
+
+function setCaptureDateToday() {
+  captureDateFilter.value = toDateInputValue(new Date());
+  refreshCaptureStatus();
+}
+
+function setCaptureDateYesterday() {
+  captureDateFilter.value = toDateInputValue(new Date(Date.now() - 24 * 60 * 60 * 1000));
+  refreshCaptureStatus();
 }
 
 async function triggerCameraCapture() {
@@ -764,6 +795,7 @@ async function createTestCapturePlan() {
       waitSeconds: CAPTURE_DEFAULT_WAIT_SECONDS
     });
     if (result.data) applyCaptureMission(result.data);
+    if (result.data?.captureDate) captureDateFilter.value = captureDateToDateInput(result.data.captureDate);
     testPlanMessage.value = `${result.message || '测试拍摄计划已创建'}：${captureMissionLabel.value}`;
     statusText.value = testPlanMessage.value;
   } catch (error) {
@@ -1006,8 +1038,19 @@ function switchView(view: 'console' | 'logs' | 'camera') {
     loadLogs();
   }
   if (view === 'camera') {
-    loadCaptureStatus(captureMission.missionId);
+    loadCaptureStatus();
     loadPiStatus();
+  }
+  if (view === 'console') {
+    nextTick(() => {
+      initializeMap();
+      map?.checkResize?.();
+      map?.resize?.();
+      updateMapOverlays();
+      updateRouteOverlays();
+      updateHomeOverlay();
+      updateShipOverlayPosition();
+    });
   }
 }
 
@@ -1044,6 +1087,19 @@ function formatNullable(value: unknown, digits = 2) {
 function toLocalDateInput(date: Date) {
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
   return local.toISOString().slice(0, 16);
+}
+
+function toDateInputValue(date: Date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
+}
+
+function dateInputToCaptureDate(value: string) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value.replaceAll('-', '') : '';
+}
+
+function captureDateToDateInput(value: string) {
+  return /^\d{8}$/.test(value) ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}` : toDateInputValue(new Date());
 }
 
 function localInputToIso(value: string) {
@@ -1561,6 +1617,16 @@ function addWaypoint(lnglat: any) {
   ];
 }
 
+function addCurrentPositionWaypoint() {
+  if (state.lat == null || state.lng == null) {
+    statusText.value = '当前没有可用 GPS，无法添加当前位置航点';
+    return;
+  }
+  addWaypoint({ lat: state.lat, lng: state.lng });
+  statusText.value = `已添加当前位置为航点 ${waypoints.value.length}`;
+  updateRouteOverlays();
+}
+
 function getMapClickLngLat(event: MouseEvent | PointerEvent) {
   if (!map || !mapContainer) return null;
 
@@ -1866,7 +1932,7 @@ function bindMapMoveEvents() {
       <b>{{ voltageLabel }}</b>
     </button>
 
-    <section v-if="activeView === 'console'" class="layout">
+    <section v-show="activeView === 'console'" class="layout">
       <div class="map-panel">
         <div
           :ref="bindMap"
@@ -1993,6 +2059,7 @@ function bindMapMoveEvents() {
             <strong>{{ waypoints.length }} 点</strong>
           </div>
           <div class="route-actions">
+            <button @click="addCurrentPositionWaypoint" :disabled="state.lat == null || state.lng == null">当前位置设为航点</button>
             <button @click="undoWaypoint" :disabled="waypoints.length === 0">撤销</button>
             <button @click="clearWaypoints" :disabled="waypoints.length === 0">清空</button>
           </div>
@@ -2192,7 +2259,7 @@ function bindMapMoveEvents() {
       </aside>
     </section>
 
-    <section v-else-if="activeView === 'camera'" class="camera-page">
+    <section v-show="activeView === 'camera'" class="camera-page">
       <div class="panel camera-hero">
         <div>
           <p class="eyebrow">Camera Test</p>
@@ -2262,16 +2329,16 @@ function bindMapMoveEvents() {
         <div class="panel camera-card">
           <div class="camera-card__title">
             <strong>树莓派接口</strong>
-            <button @click="loadCaptureStatus(captureMission.missionId)">刷新</button>
+            <button @click="refreshCaptureStatus">刷新</button>
           </div>
           <dl class="camera-endpoints">
             <div>
               <dt>WebSocket</dt>
-              <dd>ws://121.40.86.143:4100/api/pi/ws</dd>
+              <dd>ws://123.207.218.215:4100/api/pi/ws</dd>
             </div>
             <div>
               <dt>上传</dt>
-              <dd>http://121.40.86.143:4100/api/captures/upload</dd>
+              <dd>http://123.207.218.215:4100/api/captures/upload</dd>
             </div>
             <div>
               <dt>计划</dt>
@@ -2306,6 +2373,17 @@ function bindMapMoveEvents() {
         <div class="camera-card__title">
           <strong>拍摄计划与上传验收</strong>
           <span>{{ captureMission.points.length }} 个拍照点</span>
+        </div>
+        <div class="capture-date-filter">
+          <label>
+            <span>拍摄日期</span>
+            <input v-model="captureDateFilter" type="date" @change="refreshCaptureStatus" />
+          </label>
+          <div>
+            <button type="button" @click="setCaptureDateToday">今天</button>
+            <button type="button" @click="setCaptureDateYesterday">昨天</button>
+            <button type="button" @click="refreshCaptureStatus">刷新</button>
+          </div>
         </div>
         <div v-if="captureMission.points.length === 0" class="capture-empty">暂无拍摄计划。可创建测试拍摄计划，或上传包含拍照点的航线。</div>
         <div v-else class="camera-points">
@@ -2344,7 +2422,7 @@ function bindMapMoveEvents() {
       </div>
     </section>
 
-    <section v-else class="logs-page">
+    <section v-show="activeView === 'logs'" class="logs-page">
       <div class="logs-toolbar panel">
         <label>
           <span>开始</span>

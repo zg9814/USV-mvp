@@ -1,5 +1,40 @@
 # 变更记录
 
+## 2026-06-30
+
+### 修复：自动航线拍照触发改为完整脉冲
+
+- 修复拍照航点自动任务只发送 `DO_SET_RELAY=181 value=1`，未明确拉低，导致树莓派依赖上升沿时无法正确触发的问题。
+- 拍照点现在生成：
+  - `MAV_CMD_DO_SET_RELAY=181`，Relay 拉高。
+  - `MAV_CMD_CONDITION_DELAY=112`，延迟 `CAPTURE_AUX_PULSE_SECONDS`。
+  - `MAV_CMD_DO_SET_RELAY=181`，Relay 拉低。
+- 事件日志新增可区分的任务项标签：
+  - `MISSION_AUX_CAPTURE_HIGH`
+  - `MISSION_AUX_CAPTURE_DELAY`
+  - `MISSION_AUX_CAPTURE_LOW`
+- 任务 readback 校验同步支持 high/delay/low 三段校验。
+- 已部署到云端 `123.207.218.215:4100`，PM2 应用 `usv-cloud-mvp` 已重启。
+
+### 更新：排口识别模型与运行参数
+
+- 已用本地模型 `C:\Users\Lenovo\Documents\USV-cam\models\outfall_yolov8s.pt` 替换云端：
+  - `/opt/usv-cloud-mvp/models/outfall_yolov8s.pt`
+- 云端识别使用 CPU 推理。
+- 当前生产参数：
+  - `OUTFALL_CONFIDENCE=0.50`
+  - `OUTFALL_IOU=0.45`
+  - `OUTFALL_DETECTION_PYTHON=/opt/usv-cloud-mvp/.venv/bin/python`
+
+### 更新：生产环境与树莓派上传链路
+
+- 当前生产地址更新为 `123.207.218.215:4100`。
+- 树莓派继续连接：
+  - `ws://123.207.218.215:4100/api/pi/ws`
+  - `http://123.207.218.215:4100/api/captures/upload`
+- `/api/captures/upload` 在 4100 本地保存、入库和 AI 识别后，会额外转发同一份 multipart 到 `127.0.0.1:8088/api/captures/upload`。
+- 树莓派不需要直连 `8088`。
+
 ## 2026-06-12
 
 ### 新增：摄像头高电平单独触发测试
